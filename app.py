@@ -37,15 +37,18 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log=logging.getLogger('guard')
 TOKEN=os.environ['BOT_TOKEN']
-GROUPS=parse_group_ids(os.getenv('GROUP_IDS') or os.environ.get('GROUP_ID',''))
-DEFAULT_GROUP=GROUPS[0]
+# Runtime registry: groups are detected from Telegram and persisted in PostgreSQL.
+# Legacy GROUP_IDS/GROUP_ID are optional bootstrap values for a V7 migration.
+LEGACY_GROUP_IDS=parse_group_ids(os.getenv('GROUP_IDS') or os.getenv('GROUP_ID',''))
+GROUPS=list(LEGACY_GROUP_IDS)
+DEFAULT_GROUP=GROUPS[0] if GROUPS else None
 
 def current_group():
-    return _current_group(DEFAULT_GROUP)
+    return _current_group(DEFAULT_GROUP or (GROUPS[0] if GROUPS else None))
 
 def bind_group(update, ctx):
     chat=update.effective_chat
-    gid=chat.id if chat and chat.type in ('group','supergroup') else private_group_selection(ctx.user_data,GROUPS)
+    gid=chat.id if chat and chat.type in ('group','supergroup') else (private_group_selection(ctx.user_data,GROUPS) if GROUPS else None)
     if gid in GROUPS:
         select_group(gid,GROUPS)
     return gid in GROUPS
@@ -54,8 +57,8 @@ OWNERS={int(v.strip()) for v in os.environ['OWNER_IDS'].split(',') if v.strip()}
 TRUSTED_USER_IDS={int(v.strip()) for v in os.getenv('TRUSTED_USER_IDS','').split(',') if v.strip()}
 PAYMENT_DETAILS={
     'crypto':os.getenv('PAYMENT_CRYPTO_DETAILS','').strip(),
-    'paysafecard':os.getenv('PAYMENT_PAYSAFECARD_DETAILS','').strip(),
-    'apple_pay':os.getenv('PAYMENT_APPLE_PAY_DETAILS','').strip()
+    'paypal':os.getenv('PAYMENT_PAYPAL_DETAILS','').strip(),
+    'revolut':os.getenv('PAYMENT_REVOLUT_DETAILS','').strip()
 }
 TZ=os.getenv('TZ','Europe/Paris')
 DB=os.environ['DATABASE_URL'].replace('postgresql+asyncpg://','postgresql://')
@@ -89,7 +92,7 @@ async def trusted(db,uid):
     return is_owner(uid) or uid in TRUSTED_USER_IDS or bool(await db.fetchval('SELECT 1 FROM trusted WHERE user_id=$1',uid))
 
 # Group setup is explicit: adding the bot to Telegram does not activate it.
-# This deployment deliberately supports a SINGLE allowlisted supergroup (GROUP_ID).
+# Registration is dynamic, and each group must be confirmed by a real Telegram admin.
 async def group_active(db):
     return await cfg(db,'group_activation')=='active'
 
@@ -152,88 +155,135 @@ async def setup_prompt(bot,db,chat,actor):
                                'Vérifie ses permissions et utilise /setup dans le groupe.')
         return False
 
+async def is_registered_vip_destination(ctx, chat_id):
+    # A VIP destination must not be managed as a regular scheduled group.
+    for pool in tuple(ctx.application.bot_data['pools'].values()):
+        if await pool.fetchval('SELECT 1 FROM vip_registered_chats WHERE chat_id=$1',chat_id):
+            return True
+    return False
+
+
+async def register_group(application, chat_id, title):
+    """Persist a discovered group and initialize its separate database schema.
+
+    The first group keeps public (V6/V7 backward compatibility). Only callers
+    that have verified Telegram administrator status may call this function.
+    """
+    global DEFAULT_GROUP
+    if not isinstance(chat_id,int) or chat_id >= 0:
+        raise ValueError('Identifiant de groupe invalide')
+    async with application.bot_data['registration_lock']:
+        registry=application.bot_data['registry_pool']
+        async with registry.acquire() as conn:
+            async with conn.transaction():
+                first=await conn.fetchval('''SELECT first_group_id FROM public.guard_registry
+                    WHERE registry_key='primary_group' FOR UPDATE''')
+                if first is None:
+                    await conn.execute('''INSERT INTO public.guard_registry(registry_key,first_group_id)
+                          VALUES('primary_group',$1) ON CONFLICT DO NOTHING''',chat_id)
+                    first=await conn.fetchval('''SELECT first_group_id FROM public.guard_registry
+                        WHERE registry_key='primary_group' ''')
+                first=int(first)
+                schema=schema_for(chat_id,first)
+                await conn.execute(f'CREATE SCHEMA IF NOT EXISTS {schema}')
+                await conn.execute('''INSERT INTO public.guard_groups(chat_id,title)
+                       VALUES($1,$2) ON CONFLICT(chat_id) DO UPDATE SET title=EXCLUDED.title''',
+                       chat_id,(title or str(chat_id))[:255])
+        if chat_id not in application.bot_data['pools']:
+            pool=await asyncpg.create_pool(DB,min_size=1,max_size=3,
+                             server_settings={'search_path':schema})
+            try:
+                async with pool.acquire() as conn:
+                    await conn.execute(application.bot_data['schema_sql'])
+                    for key,value in DEFAULTS.items():
+                        await conn.execute('''INSERT INTO config(key,value) VALUES($1,$2)
+                                              ON CONFLICT DO NOTHING''',key,value)
+            except Exception:
+                await pool.close()
+                raise
+            application.bot_data['pools'][chat_id]=pool
+        if chat_id not in GROUPS:
+            GROUPS.append(chat_id)
+        DEFAULT_GROUP=first
+        return application.bot_data['pools'][chat_id]
+
+
 async def group_setup_command(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     bind_group(update,ctx)
     msg=update.effective_message
     chat=update.effective_chat
-    user=update.effective_user
+    actor=update.effective_user
     if not chat or chat.type not in ('group','supergroup') or not msg:return
-    if chat.id not in GROUPS:
-        for group_pool in ctx.application.bot_data['pools'].values():
-            if await group_pool.fetchval('SELECT 1 FROM vip_registered_chats WHERE chat_id=$1',chat.id):
-                await msg.reply_text('💎 Groupe VIP enregistré. La modération programmée ne s’applique pas ici.')
-                return
-        try:
-            await msg.reply_text('Ce bot est réservé au groupe autorisé. Il va quitter ce groupe.')
-        except TelegramError:pass
-        try:await ctx.bot.leave_chat(chat.id)
-        except TelegramError:pass
-        return
-    if chat.type!='supergroup':
-        await msg.reply_text('Convertis ce groupe en supergroupe et mets à jour GROUP_ID sur Railway.')
-        return
-    if not await telegram_group_admin(ctx.bot,chat.id,user):
+    if not await telegram_group_admin(ctx.bot,chat.id,actor):
         await quiet_delete(ctx.bot,chat.id,msg.message_id)
         return
-    db=await db_conn(ctx)
+    if chat.type!='supergroup':
+        await msg.reply_text('Convertis le groupe en supergroupe Telegram, puis relance /setup.')
+        return
+    if chat.id not in GROUPS and await is_registered_vip_destination(ctx,chat.id):
+        await msg.reply_text('💎 Destination VIP reconnue : les horaires normaux ne s’appliquent pas ici.')
+        return
+    db=await register_group(ctx.application,chat.id,chat.title or str(chat.id))
+    bind_group(update,ctx)
     await quiet_delete(ctx.bot,chat.id,msg.message_id)
     if await group_active(db):
         gaps=await group_rights(ctx.bot,chat.id)
         if not gaps:
-            await ctx.bot.send_message(chat.id,'✅ Le bot est déjà activé et ses permissions sont valides.')
+            await ctx.bot.send_message(chat.id,'✅ Bot déjà actif et droits valides.')
             return
         await deactivate_group(db)
-    await setup_prompt(ctx.bot,db,chat,user)
+    await setup_prompt(ctx.bot,db,chat,actor)
+
 
 async def bot_membership_update(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    bind_group(update,ctx)
-    """Telegram my_chat_member: join, leave, and privilege changes of THIS bot."""
+    """Auto-detect group creation and request admin confirmation."""
     event=update.my_chat_member
     if not event or event.chat.type not in ('group','supergroup'):return
     chat=event.chat
     new=event.new_chat_member
-    if chat.id not in GROUPS:
-        for group_pool in ctx.application.bot_data['pools'].values():
-            if await group_pool.fetchval('SELECT 1 FROM vip_registered_chats WHERE chat_id=$1',chat.id):
-                log.info('VIP destination group %s: ignoring moderation activation',chat.id)
-                return
-        if new.status not in ('left','kicked'):
-            try:await ctx.bot.send_message(chat.id,'🚫 Ce bot est réservé à un autre groupe.')
-            except TelegramError:pass
-            try:await ctx.bot.leave_chat(chat.id)
-            except TelegramError:log.exception('Could not leave unauthorized group %s',chat.id)
-        return
-    db=await db_conn(ctx)
     if new.status in ('left','kicked'):
-        await deactivate_group(db)
-        await notify_owner(ctx.bot,'⚠️ Le bot a été retiré du groupe. Activation réinitialisée.')
+        if chat.id in GROUPS:
+            bind_group(update,ctx)
+            await deactivate_group(await db_conn(ctx))
+            await notify_owner(ctx.bot,f'⚠️ Le bot a été retiré du groupe {chat.title} ({chat.id}).')
+        return
+    if chat.id not in GROUPS and await is_registered_vip_destination(ctx,chat.id):
+        log.info('VIP destination %s: no regular group setup',chat.id)
         return
     actor=event.from_user
-    # If an already approved bot merely has privileges edited, keep activation
-    # only if ALL critical rights remain. Never auto-grant a missing right.
+    if chat.id not in GROUPS:
+        if not await telegram_group_admin(ctx.bot,chat.id,actor):
+            try:await ctx.bot.send_message(chat.id,'🚫 Installation non autorisée : administrateur requis.')
+            except TelegramError:pass
+            try:await ctx.bot.leave_chat(chat.id)
+            except TelegramError:log.exception('Cannot leave unauthorized group %s',chat.id)
+            return
+        if chat.type!='supergroup':
+            try:await ctx.bot.send_message(chat.id,'⚠️ Convertis ce groupe en supergroupe pour activer le bot.')
+            except TelegramError:pass
+            return
+        try:
+            await register_group(ctx.application,chat.id,chat.title or str(chat.id))
+        except Exception:
+            log.exception('Could not register detected group %s',chat.id)
+            await notify_owner(ctx.bot,f'⚠️ Enregistrement PostgreSQL impossible : {chat.id}')
+            return
+    bind_group(update,ctx)
+    db=await db_conn(ctx)
     if await group_active(db):
         missing=await group_rights(ctx.bot,chat.id)
         if not missing:return
         await deactivate_group(db)
-        await notify_owner(ctx.bot,'⚠️ Le bot a perdu des droits dans le groupe : '+', '.join(missing)+'. '
-                                   'Nouvelle confirmation nécessaire : /setup dans le groupe.')
-        try:await ctx.bot.send_message(chat.id,'⚠️ Droits du bot insuffisants. Modération désactivée. '
-                                                'Un administrateur doit vérifier les droits, puis utiliser /setup.')
+        await notify_owner(ctx.bot,f'⚠️ Droits insuffisants sur {chat.title} ({chat.id}) : '+', '.join(missing))
+        try:await ctx.bot.send_message(chat.id,'⚠️ Droits manquants : modération suspendue. '
+                                                'Un administrateur doit relancer /setup.')
         except TelegramError:pass
         return
     if not await telegram_group_admin(ctx.bot,chat.id,actor):
-        await deactivate_group(db)
-        try:await ctx.bot.send_message(chat.id,'🚫 Seul un administrateur peut ajouter et activer ce bot.')
-        except TelegramError:pass
-        try:await ctx.bot.leave_chat(chat.id)
-        except TelegramError:log.exception('Cannot leave after unauthorized group add')
         return
-    if chat.type!='supergroup':
-        try:await ctx.bot.send_message(chat.id,'⚠️ Il faut un supergroupe Telegram pour la modération. '
-                                               'Convertis le groupe avant de réessayer.')
-        except TelegramError:pass
-        return
-    await setup_prompt(ctx.bot,db,chat,actor)
+    if chat.type=='supergroup':
+        await setup_prompt(ctx.bot,db,chat,actor)
+
 
 async def activation_callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     bind_group(update,ctx)
@@ -558,7 +608,7 @@ async def report_action(bot,db,target,ban_user=True):
 async def on_message(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     bind_group(update,ctx)
     msg=update.effective_message
-    if not msg or msg.chat_id!=current_group() or not msg.from_user or msg.from_user.is_bot:return
+    if not msg or msg.chat_id not in GROUPS or msg.chat_id!=current_group() or not msg.from_user or msg.from_user.is_bot:return
     db=await db_conn(ctx)
     if not await group_active(db):return
     u=msg.from_user
@@ -711,8 +761,9 @@ async def display_admin(ctx, page, *, q=None, msg=None, offset=0):
     elif page=='groups':
         text='🌍 <b>GROUPES AUTORISÉS</b>\n\nChoisis le groupe à administrer. Les réglages et les membres sont isolés.'
         rows=[]
+        titles={r['chat_id']:r['title'] for r in await ctx.application.bot_data['registry_pool'].fetch('SELECT chat_id,title FROM public.guard_groups')}
         for index,gid in enumerate(GROUPS,1):
-            rows.append([(f'{"✅" if gid==current_group() else "▫️"} Groupe {index} ({gid})',
+            rows.append([(f'{"✅" if gid==current_group() else "▫️"} {short(titles.get(gid) or f"Groupe {index}",25)} ({gid})',
                           f'group:{gid}',None)])
         rows.append(back_row())
     elif page=='schedules':
@@ -837,6 +888,7 @@ async def display_admin(ctx, page, *, q=None, msg=None, offset=0):
               f'Analyses médias en attente : {pending} (dont {stale} depuis +15 min)\n'
               f'Accès VIP à livrer : {undelivered}\n'
               f'Abonnements expirés à traiter : {expiring}\n'
+              f'Moyens déclarés : {", ".join(k for k,v in PAYMENT_DETAILS.items() if v) or "aucun configuré"}\n'
               'Analyse vidéo : FFmpeg imageio-ffmpeg requis\n'
               'Limite cloud Telegram : 20 MiB par téléchargement\n\n'
               'Ce diagnostic ne remplace pas un test de bout en bout sur Railway.')
@@ -907,6 +959,9 @@ async def display_admin(ctx, page, *, q=None, msg=None, offset=0):
 async def panel(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     bind_group(update,ctx)
     if update.effective_chat.type!='private' or not is_owner(update.effective_user.id):return
+    if not GROUPS:
+        await update.effective_message.reply_text('Ajoute d’abord le bot comme administrateur dans un supergroupe, puis confirme son activation. Aucun GROUP_ID Railway nécessaire.')
+        return
     ctx.user_data.pop('adm_pending',None)
     await display_admin(ctx,'home',msg=update.effective_message)
 
@@ -1018,6 +1073,8 @@ async def admin_callbacks(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if not q:return
     if q.message.chat.type!='private' or not is_owner(q.from_user.id):
         await q.answer('Accès réservé au propriétaire.',show_alert=True);return
+    if not GROUPS:
+        await q.answer('Aucun groupe enregistré.',show_alert=True);return
     data=(q.data or '')[4:]
     if data.startswith('group:'):
         try:gid=int(data.split(':')[1])
@@ -1488,14 +1545,18 @@ async def send_payment_methods(ctx,uid,q):
         return
     total=sum((Decimal(str(o['price_eur'])) for o in offers), Decimal('0'))
     lang=await member_language(db,uid)
-    kb=InlineKeyboardMarkup([
-        [InlineKeyboardButton('Crypto',callback_data='vip:method:crypto'),
-         InlineKeyboardButton('Paysafecard',callback_data='vip:method:paysafecard')],
-        [InlineKeyboardButton('Apple Pay (15% frais)',callback_data='vip:method:apple_pay')],
-        [InlineKeyboardButton('↩ Retour',callback_data='vip:go')]
-    ])
+    choices=[('Crypto','crypto'),('PayPal','paypal'),('Revolut','revolut')]
+    available=[InlineKeyboardButton(label,callback_data=f'vip:method:{key}')
+               for label,key in choices if PAYMENT_DETAILS[key]]
+    rows=[available[:2]] if available else []
+    if len(available)>2:rows.append(available[2:])
+    rows.append([InlineKeyboardButton('↩ Retour',callback_data='vip:go')])
+    kb=InlineKeyboardMarkup(rows)
     await q.answer()
-    await show_screen(q,payment_methods_view(total,lang),kb,edit=True)
+    txt=payment_methods_view(total,lang,[key for label,key in choices if PAYMENT_DETAILS[key]])
+    if not available:
+        txt+='\n\n⚠️ Aucun mode de règlement n’est configuré. Contacte un administrateur.'
+    await show_screen(q,txt,kb,edit=True)
 
 async def create_manual_order(db,uid,method):
     '''Snapshot offers/prices; only one awaiting-proof order per user.'''
@@ -1532,7 +1593,7 @@ async def send_manual_instructions(ctx,uid,q,method):
         await q.answer('Panier vide, réessaie avec /vips.',show_alert=True)
         return
     order_id,total=created
-    pretty={'crypto':'Crypto','paysafecard':'Paysafecard','apple_pay':'Apple Pay'}[method]
+    pretty={'crypto':'Crypto','paypal':'PayPal','revolut':'Revolut'}[method]
     txt=(f'<b>Commande VIP — {escape(pretty)}</b>\n\n'
          f'📋 Référence : <code>{order_id}</code>\n'
          f'💶 Montant : <b>{money(total)}</b>\n\n'
@@ -1552,6 +1613,8 @@ async def commerce_callbacks(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if not q.message or q.message.chat.type!='private':
         await q.answer('Ouvre le bot en privé.',show_alert=True)
         return
+    if not GROUPS:
+        await q.answer('Aucun groupe enregistré.',show_alert=True);return
     uid=q.from_user.id
     db=await db_conn(ctx)
     if not await group_active(db):
@@ -1625,8 +1688,10 @@ async def owner_photo_or_proof(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     await manual_proof(update,ctx)
 
 async def manual_proof(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    bind_group(update,ctx)
-    '''Collect image only. Proof is NOT considered proof of payment.'''
+    """Route payment screenshots to orders in the correct managed group.
+
+    A screenshot is not verification of a successful payment.
+    """
     msg=update.effective_message
     if not msg or update.effective_chat.type!='private' or not update.effective_user:return
     doc=msg.document
@@ -1634,24 +1699,43 @@ async def manual_proof(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         return
     image=msg.photo[-1] if msg.photo else doc
     if not image:return
-    db=await db_conn(ctx)
-    if not await group_active(db):
-        await msg.reply_text('🔐 Commandes suspendues : le groupe doit être activé par un administrateur.')
+    matches=[]
+    for gid,pool in tuple(ctx.application.bot_data['pools'].items()):
+        pending=await pool.fetchval('''SELECT 1 FROM manual_vip_orders
+                WHERE user_id=$1 AND status='awaiting_proof' LIMIT 1''',msg.from_user.id)
+        if pending:matches.append((gid,pool))
+    if not matches:
+        await msg.reply_text('Aucune commande en attente de justificatif. Utilise /vips pour commencer.')
         return
+    if len(matches)>1:
+        selected=current_group()
+        chosen=next(((gid,pool) for gid,pool in matches if gid==selected),None)
+        if chosen is None:
+            await msg.reply_text('Plusieurs commandes sont en attente dans différents groupes. '
+                                 'Choisis le groupe avec /groups puis renvoie ton justificatif.')
+            return
+    else:
+        chosen=matches[0]
+    gid,db=chosen
+    select_group(gid,GROUPS)
     order=await db.fetchrow('''UPDATE manual_vip_orders SET status='review',proof_file_id=$2,
                               proof_message_id=$3,proof_at=now() WHERE id=(
                               SELECT id FROM manual_vip_orders WHERE user_id=$1 AND status='awaiting_proof'
                               ORDER BY created_at DESC LIMIT 1 FOR UPDATE)
                               RETURNING *''',msg.from_user.id,image.file_id,msg.message_id)
     if not order:
-        await msg.reply_text('Aucune commande en attente de justificatif. Utilise /vips pour commencer.')
+        await msg.reply_text('La commande vient de changer de statut. Réessaie.')
         return
     oid=order['id']
-    await msg.reply_text(f'✅ Justificatif reçu pour la commande {oid[:8]}. En attente de vérification par un administrateur.')
+    await msg.reply_text(f'✅ Justificatif reçu pour la commande {oid[:8]}. '
+                         'En attente de vérification par un propriétaire.')
+    method_name={'crypto':'Crypto','paypal':'PayPal','revolut':'Revolut',
+                 'paysafecard':'Paysafecard (historique)',
+                 'apple_pay':'Apple Pay (historique)'}.get(order['method'],order['method'])
     caption=(f'🧾 JUSTIFICATIF À VÉRIFIER\nCommande : {oid}\n'
-             f'Utilisateur : {msg.from_user.id}\nMéthode : {order["method"]}\n'
+             f'Groupe : {gid}\nUtilisateur : {msg.from_user.id}\nMéthode : {method_name}\n'
              f'Montant déclaré : {money(order["final_total_eur"])}\n'
-             '⚠️ Vérifier le paiement réellement reçu sur le compte externe, pas seulement la capture.')
+             '⚠️ Vérifier la réception effective des fonds ; la capture seule ne suffit pas.')
     kb=InlineKeyboardMarkup([[InlineKeyboardButton('✅ Paiement réellement reçu',callback_data=f'review:{oid}:approve',style='success')],
                              [InlineKeyboardButton('❌ Refuser',callback_data=f'review:{oid}:reject',style='danger')]])
     for owner in OWNERS:
@@ -1660,6 +1744,7 @@ async def manual_proof(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
             await ctx.bot.send_message(owner,caption,reply_markup=kb)
         except TelegramError:
             log.exception('Cannot notify owner %s of manual VIP order %s',owner,oid)
+
 
 async def decide_manual_order(bot,db,oid,actor,approved):
     '''Single-use manual decision, atomic membership grant on approval.'''
@@ -1701,7 +1786,16 @@ async def review_callbacks(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         await q.answer('Commande invalide.',show_alert=True)
         return
     oid,decision=match.groups()
-    db=await db_conn(ctx)
+    # Owner's selected panel group is irrelevant: route by order reference.
+    matches=[]
+    for gid,pool in tuple(ctx.application.bot_data['pools'].items()):
+        if await pool.fetchval('SELECT 1 FROM manual_vip_orders WHERE id=$1',oid):
+            matches.append((gid,pool))
+    if len(matches)!=1:
+        await q.answer('Commande introuvable ou ambiguë.',show_alert=True)
+        return
+    gid,db=matches[0]
+    select_group(gid,GROUPS)
     success=await decide_manual_order(ctx.bot,db,oid,q.from_user.id,decision=='approve')
     await q.answer('Décision enregistrée.' if success else 'Déjà traité ou justificatif absent.',show_alert=True)
     if success:
@@ -1736,6 +1830,9 @@ async def select_private_group(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     """Choose which of the managed groups the private bot menus control."""
     bind_group(update,ctx)
     if update.effective_chat.type!='private':return
+    if not GROUPS:
+        await update.effective_message.reply_text('Aucun groupe enregistré. Ajoute le bot comme admin dans un supergroupe et confirme son activation.')
+        return
     rows=[]
     for i,gid in enumerate(GROUPS,1):
         rows.append([InlineKeyboardButton(f'🌍 Groupe {i}',callback_data=f'pick:{gid}')])
@@ -1758,6 +1855,9 @@ async def commands(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     bind_group(update,ctx)
     msg=update.effective_message;uid=update.effective_user.id
     if update.effective_chat.type!='private':return
+    if not GROUPS:
+        await msg.reply_text('🔐 Aucun groupe enregistré. Ajoute le bot comme administrateur dans un supergroupe puis confirme dans le groupe.')
+        return
     db=await db_conn(ctx)
     name=msg.text.split()[0].split('@')[0].lower()
     if name=='/start':
@@ -2109,38 +2209,56 @@ async def periodic_delivery(ctx):
     await _run_for_all_groups(ctx,manual_delivery_retry)
 
 async def start_app():
-    # Preserve the existing V6 public schema for group #1, create independent
-    # schemas for further explicitly allowlisted groups. Never reuse a single
-    # schema across groups: IDs, session rules, subscriptions would collide.
-    pool_admin=await asyncpg.create_pool(DB,min_size=1,max_size=2)
-    async with pool_admin.acquire() as conn:
+    """One worker for many groups, discovered from Telegram updates.
+
+    The public legacy schema is assigned using the durable primary-group id.
+    Legacy GROUP_IDS is optional and only used to bootstrap V7 migrations.
+    """
+    registry=await asyncpg.create_pool(DB,min_size=1,max_size=2)
+    async with registry.acquire() as conn:
         await conn.execute('''CREATE TABLE IF NOT EXISTS public.guard_registry (
             registry_key text PRIMARY KEY, first_group_id bigint NOT NULL)''')
-        primary=await conn.fetchval('''SELECT first_group_id FROM public.guard_registry
-                                     WHERE registry_key='primary_group' ''')
-        if primary is not None and int(primary)!=DEFAULT_GROUP:
-            raise RuntimeError('GROUP_IDS : le premier groupe doit rester le même que lors de l’installation. '
-                               'La base publique contient ses données ; ne réordonne pas GROUP_IDS.')
-        await conn.execute('''INSERT INTO public.guard_registry(registry_key,first_group_id)
-                              VALUES('primary_group',$1) ON CONFLICT DO NOTHING''',DEFAULT_GROUP)
-        for gid in GROUPS:
-            schema=schema_for(gid,DEFAULT_GROUP)
-            await conn.execute(f'CREATE SCHEMA IF NOT EXISTS {schema}')
-    await pool_admin.close()
+        await conn.execute('''CREATE TABLE IF NOT EXISTS public.guard_groups (
+            chat_id bigint PRIMARY KEY, title text NOT NULL,
+            registered_at timestamptz NOT NULL DEFAULT now())''')
+        existing=await conn.fetchval('''SELECT first_group_id FROM public.guard_registry
+                        WHERE registry_key='primary_group' ''')
+        if existing is not None and LEGACY_GROUP_IDS and int(existing)!=LEGACY_GROUP_IDS[0]:
+            raise RuntimeError('Migration V7 : le premier GROUP_IDS ne correspond pas au groupe historique. '
+                               'Corrige cette variable ou supprime-la : le registre PostgreSQL fait foi.')
+        if existing is None and LEGACY_GROUP_IDS:
+            await conn.execute('''INSERT INTO public.guard_registry(registry_key,first_group_id)
+                           VALUES('primary_group',$1) ON CONFLICT DO NOTHING''',LEGACY_GROUP_IDS[0])
+        for gid in LEGACY_GROUP_IDS:
+            await conn.execute('''INSERT INTO public.guard_groups(chat_id,title)
+                          VALUES($1,$2) ON CONFLICT DO NOTHING''',gid,f'Groupe migré {gid}')
+        existing=await conn.fetchval('''SELECT first_group_id FROM public.guard_registry
+                                WHERE registry_key='primary_group' ''')
+        # V7 additional groups have numeric guard_<id> schemas. Recover them
+        # from PostgreSQL even when GROUP_IDS has already been removed.
+        old_schemas=await conn.fetch('''SELECT n.nspname FROM pg_namespace n
+                WHERE n.nspname ~ '^guard_[0-9]{5,20}$'
+                  AND EXISTS (SELECT 1 FROM information_schema.tables t
+                    WHERE t.table_schema=n.nspname AND t.table_name='config')''')
+        for row in old_schemas:
+            gid=-int(row['nspname'].removeprefix('guard_'))
+            await conn.execute('''INSERT INTO public.guard_groups(chat_id,title)
+                VALUES($1,$2) ON CONFLICT DO NOTHING''',gid,f'Groupe récupéré {gid}')
+        if existing is not None:
+            await conn.execute('''INSERT INTO public.guard_groups(chat_id,title)
+                      VALUES($1,$2) ON CONFLICT DO NOTHING''',existing,f'Groupe historique {existing}')
+        entries=await conn.fetch('''SELECT chat_id,title FROM public.guard_groups
+                   ORDER BY CASE WHEN chat_id=$1 THEN 0 ELSE 1 END,registered_at,chat_id''',existing)
     with open(os.path.join(os.path.dirname(__file__),'schema.sql'),encoding='utf-8') as f:
         schema_sql=f.read()
-    pools={}
-    for gid in GROUPS:
-        schema=schema_for(gid,DEFAULT_GROUP)
-        pool=await asyncpg.create_pool(DB,min_size=1,max_size=3,
-                                        server_settings={'search_path':schema})
-        pools[gid]=pool
-        async with pool.acquire() as conn:
-            await conn.execute(schema_sql)
-            for k,v in DEFAULTS.items():
-                await conn.execute('INSERT INTO config(key,value) VALUES($1,$2) ON CONFLICT DO NOTHING',k,v)
     app=Application.builder().token(TOKEN).build()
-    app.bot_data['pools']=pools
+    app.bot_data['registry_pool']=registry
+    app.bot_data['registration_lock']=asyncio.Lock()
+    app.bot_data['schema_sql']=schema_sql
+    app.bot_data['pools']={}
+    GROUPS.clear()  # DB registry is authoritative after one-time migration.
+    for row in entries:
+        await register_group(app,int(row['chat_id']),row['title'])
     app.add_handler(CommandHandler('setup',group_setup_command))
     app.add_handler(CommandHandler('panel',panel))
     app.add_handler(CommandHandler('groups',select_private_group))
@@ -2156,19 +2274,22 @@ async def start_app():
     app.add_handler(ChatMemberHandler(bot_membership_update,ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(join_update,ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(ChatJoinRequestHandler(vip_join_request))
-    app.add_handler(MessageHandler(filters.Chat(GROUPS) & ~filters.StatusUpdate.ALL,on_message))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL,on_message))
     app.add_error_handler(on_error)
     app.job_queue.run_repeating(periodic_tick,60,first=3,name='tick_all')
     app.job_queue.run_repeating(periodic_expiry,60,first=60,name='vip_expiry_all')
     app.job_queue.run_repeating(periodic_delivery,300,first=90,name='delivery_all')
-    async with app:
-        await app.start()
-        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=False)
-        log.info('Bot running (allowed groups=%s)',GROUPS)
-        try:await asyncio.Event().wait()
-        finally:
-            await app.updater.stop()
-            await app.stop()
-            for pool in pools.values():await pool.close()
+    try:
+        async with app:
+            await app.start()
+            await app.updater.start_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=False)
+            log.info('Bot running (auto-discovery enabled; groups=%s)',GROUPS)
+            try:await asyncio.Event().wait()
+            finally:
+                await app.updater.stop()
+                await app.stop()
+    finally:
+        for pool in tuple(app.bot_data['pools'].values()):await pool.close()
+        await registry.close()
 
 if __name__=='__main__':asyncio.run(start_app())

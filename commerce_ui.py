@@ -14,8 +14,8 @@ def money(value):
 
 def payment_total(value, method):
     amount = Decimal(str(value))
-    if method == 'apple_pay':
-        amount *= Decimal('1.15')
+    if method not in ('crypto', 'paypal', 'revolut'):
+        raise ValueError('Mode de paiement non pris en charge')
     return amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
 
@@ -65,11 +65,16 @@ def vip_confirm_view(offers, lang='fr'):
     return '\n'.join(lines), total
 
 
-def payment_methods_view(total, lang='fr'):
+def payment_methods_view(total, lang='fr', methods=None):
+    """Show only payment methods for which instructions are configured."""
     en = lang == 'en'
+    names={'crypto':'Crypto','paypal':'PayPal','revolut':'Revolut'}
+    chosen=tuple(names) if methods is None else tuple(m for m in methods if m in names)
+    available=' · '.join(names[m] for m in chosen)
     return (f'<b>{"Choose your payment method:" if en else "Choisis ton mode de paiement :"}</b>\n\n'
-            f'{"Order total" if en else "Total du panier"} : <b>{money(total)}</b>\n'
-            f'Apple Pay : <b>{money(payment_total(total,"apple_pay"))}</b> (+15 %)' )
+            f'{"Order total" if en else "Total du panier"} : <b>{money(total)}</b>\n\n'
+            f'{available}\n'
+            + ('No additional bot fees.' if en else 'Aucun supplément appliqué par le bot.'))
 
 
 def invite_dashboard_view(link, credited, pending, total, lang='fr'):

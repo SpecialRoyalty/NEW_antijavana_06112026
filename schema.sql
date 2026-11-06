@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS manual_vip_orders (
     user_id bigint NOT NULL,
     base_total_eur numeric(10,2) NOT NULL CHECK (base_total_eur > 0),
     final_total_eur numeric(10,2) NOT NULL CHECK (final_total_eur > 0),
-    method text NOT NULL CHECK(method IN ('crypto','paysafecard','apple_pay')),
+    method text NOT NULL CHECK(method IN ('crypto','paypal','revolut','paysafecard','apple_pay')),
     status text NOT NULL DEFAULT 'awaiting_proof'
         CHECK(status IN ('awaiting_proof','review','approved','rejected','cancelled')),
     proof_file_id text,
@@ -77,6 +77,12 @@ CREATE TABLE IF NOT EXISTS manual_vip_orders (
     reviewed_at timestamptz,
     reviewed_by bigint
 );
+-- Migration V8: preserve historical purchases with former methods for audit,
+-- while only crypto/paypal/revolut are allowed for NEW orders at application level.
+ALTER TABLE manual_vip_orders DROP CONSTRAINT IF EXISTS manual_vip_orders_method_check;
+ALTER TABLE manual_vip_orders ADD CONSTRAINT manual_vip_orders_method_check
+    CHECK (method IN ('crypto','paypal','revolut','paysafecard','apple_pay'));
+
 CREATE TABLE IF NOT EXISTS manual_vip_items (
     order_id text NOT NULL REFERENCES manual_vip_orders(id),
     vip_id bigint NOT NULL,

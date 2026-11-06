@@ -83,6 +83,18 @@ def is_owner(uid):return uid in OWNERS
 async def cfg(db,key,default=''):
     return await db.fetchval('SELECT value FROM config WHERE key=$1',key) or default
 
+async def banned_word_patterns(ctx, db):
+    """Keep the common message path from fetching the same word list every time."""
+    cache=ctx.application.bot_data.setdefault('word_cache',{})
+    gid=current_group()
+    expiry,patterns=cache.get(gid,(0,()))
+    if time.monotonic() >= expiry:
+        rows=await db.fetch('SELECT pattern FROM banned_words')
+        patterns=tuple(re.compile(r'(?<!\w)'+re.escape(row['pattern'])+r'(?!\w)',re.IGNORECASE)
+                       for row in rows if row['pattern'])
+        cache[gid]=(time.monotonic()+15,patterns)
+    return patterns
+
 async def setcfg(db,key,value):
     await db.execute('INSERT INTO config(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value',key,str(value))
 
@@ -190,7 +202,7 @@ async def register_group(application, chat_id, title):
                        VALUES($1,$2) ON CONFLICT(chat_id) DO UPDATE SET title=EXCLUDED.title''',
                        chat_id,(title or str(chat_id))[:255])
         if chat_id not in application.bot_data['pools']:
-            pool=await asyncpg.create_pool(DB,min_size=1,max_size=3,
+            pool=await asyncpg.create_pool(DB,min_size=0,max_size=3,
                              server_settings={'search_path':schema})
             try:
                 async with pool.acquire() as conn:
@@ -696,8 +708,7 @@ async def on_message(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     # Supported: text/photo/video only; reject every other message type.
     if not (msg.text or msg.photo or msg.video):
         await quiet_delete(ctx.bot,current_group(),msg.message_id);return
-    terms=await db.fetch('SELECT pattern FROM banned_words')
-    if any(re.search(r'(?<!\w)'+re.escape(r['pattern'])+r'(?!\w)',text,re.IGNORECASE) for r in terms):
+    if text and any(pattern.search(text) for pattern in await banned_word_patterns(ctx,db)):
         await quiet_delete(ctx.bot,current_group(),msg.message_id)
         count=await db.fetchval('UPDATE members SET strikes=strikes+1 WHERE user_id=$1 RETURNING strikes',u.id)
         try:await mute(ctx.bot,db,u.id,1 if count==1 else 2 if count==2 else 7)
@@ -985,6 +996,7 @@ async def admin_input(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
             if not 2<=len(text)<=120:raise ValueError('Entre 2 et 120 caractères.')
             table='banned_words' if mode=='word' else 'banned_names'
             await db.execute(f'INSERT INTO {table}(pattern) VALUES($1) ON CONFLICT DO NOTHING',text.casefold())
+            if mode=='word':ctx.application.bot_data.get('word_cache',{}).pop(current_group(),None)
             destination='filter:'+mode
         elif mode=='trusted':
             uid=parse_user_id(text)
@@ -1277,6 +1289,7 @@ async def admin_callbacks(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
                      if hashlib.blake2s(r['pattern'].encode(),digest_size=8).hexdigest()==digest]
             if len(matches)!=1:await q.answer('Filtre absent ou ambigu.',show_alert=True);return
             await db.execute(f'DELETE FROM {table} WHERE pattern=$1',matches[0])
+            if typ=='word':ctx.application.bot_data.get('word_cache',{}).pop(current_group(),None)
             destination='filter:'+typ
         elif action.startswith('rmtrust:'):
             uid=int(action.split(':')[1]);await db.execute('DELETE FROM trusted WHERE user_id=$1',uid);destination='trusted'
@@ -1924,8 +1937,10 @@ async def commands(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         elif name=='/delschedule':await db.execute('DELETE FROM schedules WHERE id=$1',int(args[0]));out='Créneau effacé.'
         elif name in ('/word','/name'):
             await db.execute(f'INSERT INTO {"banned_words" if name=="/word" else "banned_names"}(pattern) VALUES($1) ON CONFLICT DO NOTHING',' '.join(args));out='Filtre enregistré.'
+            if name=='/word':ctx.application.bot_data.get('word_cache',{}).pop(current_group(),None)
         elif name in ('/unword','/unname'):
             await db.execute(f'DELETE FROM {"banned_words" if name=="/unword" else "banned_names"} WHERE pattern=$1',' '.join(args));out='Filtre effacé.'
+            if name=='/unword':ctx.application.bot_data.get('word_cache',{}).pop(current_group(),None)
         elif name in ('/trust','/untrust'):
             target=int(args[0])
             if target<=0:raise ValueError('Identifiant Telegram invalide')

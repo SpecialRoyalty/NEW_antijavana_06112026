@@ -1,5 +1,12 @@
 # Telegram Guard Bot V8 — correction des paiements et groupes automatiques
 
+## Correctifs de cette révision
+
+- Les empreintes photo bannies des anciennes versions sont migrées vers un index de recherche lors du démarrage. La comparaison ne relit plus toute l'ancienne liste pour chaque photo.
+- Les expressions des mots interdits sont compilées et conservées 15 secondes par groupe ; les modifications faites depuis le bot invalident immédiatement ce cache.
+- Les pools PostgreSQL des groupes ne gardent plus une connexion ouverte lorsqu'ils sont inactifs. La limite de trois connexions par groupe reste applicable en charge.
+- Validation locale : 35 tests et compilation Python. Les migrations et les API Telegram doivent encore être vérifiées sur un groupe de test avec une sauvegarde PostgreSQL.
+
 > **Version de développement.** Syntaxe Python et tests locaux vérifiés ; aucun test de bout en bout n'a été réalisé avec Telegram, PostgreSQL ou Railway. Faites un essai sur un groupe isolé **avant** de remplacer un bot en production.
 
 ## Corrections V8

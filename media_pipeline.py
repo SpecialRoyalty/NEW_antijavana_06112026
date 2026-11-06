@@ -48,9 +48,7 @@ async def photo_banned(db, ph: str | None) -> bool:
        FROM media_photo_buckets b WHERE b.bucket=ANY($1::text[])''',photo_buckets(ph))
     if any(photo_matches(ph, row['phash']) for row in candidates):
         return True
-    # Backward-compatible V5 blacklist, which may not have been migrated yet.
-    previous = await db.fetch('SELECT phash FROM banned_media WHERE phash IS NOT NULL')
-    return any(photo_matches(ph,row['phash']) for row in previous)
+    return False
 
 
 async def video_banned(db, vid: str | None, duration, width, height) -> bool:

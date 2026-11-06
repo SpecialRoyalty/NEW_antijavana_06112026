@@ -142,6 +142,15 @@ CREATE TABLE IF NOT EXISTS media_photo_buckets (
  phash text NOT NULL REFERENCES media_photo_bans(phash) ON DELETE CASCADE,
  primary key(bucket,phash)
 );
+-- Copy legacy perceptual bans into indexed buckets. Both inserts are idempotent.
+INSERT INTO media_photo_bans(phash)
+SELECT phash FROM banned_media WHERE length(phash)=64
+ON CONFLICT DO NOTHING;
+INSERT INTO media_photo_buckets(bucket,phash)
+SELECT lpad(to_hex(i),2,'0') || ':' || substr(b.phash,i*4+1,4), b.phash
+FROM banned_media b CROSS JOIN generate_series(0,15) AS i
+WHERE length(b.phash)=64
+ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS media_video_bans (
  fingerprint text primary key,
  duration int,

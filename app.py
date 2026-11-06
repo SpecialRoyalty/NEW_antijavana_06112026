@@ -361,8 +361,11 @@ async def activation_callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     await tick(ctx)
 
 async def quiet_delete(bot,chat_id,msg_id):
-    try:await bot.delete_message(chat_id,msg_id)
-    except TelegramError:pass
+    try:
+        await bot.delete_message(chat_id,msg_id)
+        return True
+    except TelegramError:
+        return False
 
 async def notify_owner(bot,txt):
     for uid in OWNERS:
@@ -408,10 +411,33 @@ async def send_countdown(bot,db,txt,key):
 async def clean_open_messages(bot,db):
     # Telegram's normal deletion is time-limited; old messages stay on server.
     rows=await db.fetch('SELECT message_id FROM messages WHERE chat_id=$1 AND created_at>now()-interval \'48 hours\' ORDER BY message_id DESC LIMIT 10000',current_group())
+    # Keep failed deletions available for retry on the next closure.
     for chunk_start in range(0,len(rows),40):
-        for r in rows[chunk_start:chunk_start+40]:await quiet_delete(bot,current_group(),r['message_id'])
-        await asyncio.sleep(0.15)
-    await db.execute('DELETE FROM messages WHERE chat_id=$1',current_group())
+        batch=rows[chunk_start:chunk_start+40]
+        gate=asyncio.Semaphore(4)
+        async def remove(row):
+            async with gate:
+                return row['message_id'] if await quiet_delete(bot,current_group(),row['message_id']) else None
+        removed=await asyncio.gather(*(remove(row) for row in batch))
+        ids=[mid for mid in removed if mid is not None]
+        if ids:await db.execute('DELETE FROM messages WHERE chat_id=$1 AND message_id=ANY($2::bigint[])',current_group(),ids)
+
+async def remove_rules(bot,db):
+    rid=await cfg(db,'rules_id')
+    if not rid:return
+    try:await bot.unpin_chat_message(current_group(),message_id=int(rid))
+    except TelegramError:pass
+    if await quiet_delete(bot,current_group(),int(rid)):
+        await setcfg(db,'rules_id','')
+        await setcfg(db,'last_rules','')
+
+async def closure_text(db,now):
+    if not await flag(db,'auto_enabled'):
+        return '🔴 Groupe fermé. Réouverture par un administrateur.'
+    target=next_boundary(now,await get_rows(db),'open',TZ)
+    if not target:
+        return '🔴 Groupe fermé. Aucun horaire de réouverture programmé.'
+    return '🔴 Groupe fermé. Prochaine ouverture : '+target.strftime('%d/%m à %H:%M')+f' ({TZ}).'
 
 async def transition(bot,db,opened):
     await bot.set_chat_permissions(current_group(),OPEN_PERMS if opened else CLOSED_PERMS,
@@ -426,15 +452,15 @@ async def transition(bot,db,opened):
         await bot.send_message(current_group(),'🟢 Groupe ouvert ! Vous pouvez envoyer du texte, des photos et des vidéos.')
         await publish_rules(bot,db)
     else:
-        await bot.send_message(current_group(),'🔴 Groupe fermé. Prochaine ouverture : compte à rebours.')
+        await remove_rules(bot,db)
         await clean_open_messages(bot,db)
-        rid=await cfg(db,'rules_id')
-        if rid:await quiet_delete(bot,current_group(),int(rid))
-        await setcfg(db,'rules_id','')
+        await bot.send_message(current_group(),await closure_text(db,utcnow()))
 
 async def publish_rules(bot,db):
-    rid=await cfg(db,'rules_id')
-    if rid:await quiet_delete(bot,current_group(),int(rid))
+    await remove_rules(bot,db)
+    if await cfg(db,'rules_id'):
+        log.warning('Previous rules message could not be removed; publication deferred')
+        return
     msg=await bot.send_message(current_group(),'📌 Règles du groupe\n\n'+await cfg(db,'rules'))
     try:await bot.pin_chat_message(current_group(),msg.message_id,disable_notification=True)
     except TelegramError:pass
@@ -465,6 +491,12 @@ async def send_post(bot,db,post):
     except TelegramError:log.exception('post %s',post['id'])
 
 async def tick(ctx):
+    locks=ctx.application.bot_data.setdefault('transition_locks',{})
+    lock=locks.setdefault(current_group(),asyncio.Lock())
+    async with lock:
+        await _tick_locked(ctx)
+
+async def _tick_locked(ctx):
     bot=ctx.bot; db=await db_conn(ctx);now=utcnow()
     if not await group_active(db):return
     missing=await group_rights(bot,current_group())
@@ -477,6 +509,8 @@ async def tick(ctx):
         open_now=await is_open(db,now)
         old=await flag(db,'open_state')
         if old!=open_now:await transition(bot,db,open_now)
+        if not open_now and await cfg(db,'rules_id'):
+            await remove_rules(bot,db)
         manual=await cfg(db,'manual_until')
         if manual:
             end=datetime.fromisoformat(manual)
@@ -494,7 +528,15 @@ async def tick(ctx):
                 if not p['last_sent_at'] or (now-p['last_sent_at']).total_seconds()>=p['interval_minutes']*60:
                     await send_post(bot,db,p)
         rows=await get_rows(db)
-        if rows:
+        manual_closed=await cfg(db,'manual_closed_until')
+        manual_open=await cfg(db,'manual_until')
+        override_active=any(datetime.fromisoformat(value)>now for value in (manual_closed,manual_open) if value)
+        if override_active or not await flag(db,'auto_enabled'):
+            old_countdown=await cfg(db,'countdown_id')
+            if old_countdown:await quiet_delete(bot,current_group(),int(old_countdown))
+            await setcfg(db,'countdown_id','')
+            await setcfg(db,'countdown_key','')
+        if rows and await flag(db,'auto_enabled') and not override_active:
             kind='close' if open_now else 'open'
             target=next_boundary(now,rows,kind,TZ)
             if target:
@@ -1270,7 +1312,10 @@ async def admin_callbacks(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
             await notify_owner(ctx.bot,f'🎲 Tirage groupe {current_group()} : gagnant {winner["user_id"]} ({winner["n"]} invitations).')
             destination='raffle'
         elif action=='pubrules':
-            if await group_active(db):await publish_rules(ctx.bot,db)
+            if not await group_active(db) or not await is_open(db):
+                await q.answer('Ouvre le groupe avant de publier les règles.',show_alert=True)
+                return
+            await publish_rules(ctx.bot,db)
             destination='rules'
         elif action.startswith('banmedia:'):
             mid=int(action.split(':')[1])
@@ -1859,6 +1904,7 @@ async def private_group_callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if gid not in GROUPS:
         await q.answer('Groupe non autorisé.',show_alert=True);return
     ctx.user_data['guard_selected_group']=gid
+    ctx.user_data.pop('adm_pending',None)
     select_group(gid,GROUPS)
     await q.answer('Groupe sélectionné.')
     await q.edit_message_text(f'✅ Groupe {GROUPS.index(gid)+1} sélectionné.')
@@ -1879,6 +1925,7 @@ async def commands(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         if routed:
             action,gid=routed
             ctx.user_data['guard_selected_group']=gid
+            ctx.user_data.pop('adm_pending',None)
             select_group(gid,GROUPS)
             db=await db_conn(ctx)
             payload=action

@@ -2,10 +2,15 @@
 
 ## Correctifs de cette révision
 
+- Les transitions d'ouverture et de fermeture sont sérialisées par groupe : deux contrôles simultanés ne peuvent plus publier des annonces contradictoires.
+- La fermeture retire l'épinglage et supprime les règles avant l'annonce finale. Si Telegram refuse la suppression, l'identifiant reste enregistré pour réessayer au contrôle suivant.
+- L'annonce de fermeture donne le prochain horaire réel dans le fuseau configuré. Sans horaire actif, elle dit clairement qu'une intervention administrative est nécessaire ou qu'aucun horaire n'est prévu.
+- Les décomptes liés aux horaires automatiques sont retirés lorsqu'une ouverture ou fermeture manuelle prend la main.
+- Un changement de groupe privé annule toute saisie administrative commencée dans un autre groupe.
 - Les empreintes photo bannies des anciennes versions sont migrées vers un index de recherche lors du démarrage. La comparaison ne relit plus toute l'ancienne liste pour chaque photo.
 - Les expressions des mots interdits sont compilées et conservées 15 secondes par groupe ; les modifications faites depuis le bot invalident immédiatement ce cache.
 - Les pools PostgreSQL des groupes ne gardent plus une connexion ouverte lorsqu'ils sont inactifs. La limite de trois connexions par groupe reste applicable en charge.
-- Validation locale : 35 tests et compilation Python. Les migrations et les API Telegram doivent encore être vérifiées sur un groupe de test avec une sauvegarde PostgreSQL.
+- Validation locale : 39 tests, dont suppression des règles et transitions concurrentes, et compilation Python. Les migrations et les API Telegram doivent encore être vérifiées sur un groupe de test avec une sauvegarde PostgreSQL.
 
 > **Version de développement.** Syntaxe Python et tests locaux vérifiés ; aucun test de bout en bout n'a été réalisé avec Telegram, PostgreSQL ou Railway. Faites un essai sur un groupe isolé **avant** de remplacer un bot en production.
 

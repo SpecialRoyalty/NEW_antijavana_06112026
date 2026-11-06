@@ -48,3 +48,10 @@ def activation_text(chat_title, missing):
         'messages et gérer les invitations.\n'
         'Seul un administrateur du groupe peut valider.'
     )
+def member_present(member):
+    """Restricted members may have left despite their status label."""
+    if member.status in ('left','kicked'):
+        return False
+    if member.status=='restricted':
+        return bool(member.is_member)
+    return True

@@ -1,6 +1,9 @@
 CREATE TABLE IF NOT EXISTS config(key text primary key, value text not null);
 CREATE TABLE IF NOT EXISTS members(user_id bigint primary key, display_name text, username text, joined_at timestamptz, left_at timestamptz, messages bigint not null default 0, strikes int not null default 0, minor_strikes int not null default 0, removed_flag boolean not null default false, referred_by bigint);
+CREATE TABLE IF NOT EXISTS member_activity(user_id bigint NOT NULL,opening_serial bigint NOT NULL,message_count int NOT NULL DEFAULT 0,PRIMARY KEY(user_id,opening_serial));
+CREATE TABLE IF NOT EXISTS inactivity_warnings(user_id bigint PRIMARY KEY,warned_serial bigint NOT NULL,eligible boolean NOT NULL DEFAULT false,warned_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS events(id bigserial primary key, user_id bigint, kind text not null, created_at timestamptz not null default now());
+CREATE TABLE IF NOT EXISTS temporary_notices(message_id bigint PRIMARY KEY,expires_at timestamptz NOT NULL);
 CREATE INDEX IF NOT EXISTS events_kind_at ON events(kind, created_at);
 CREATE TABLE IF NOT EXISTS messages(chat_id bigint not null, message_id bigint not null, user_id bigint not null, created_at timestamptz not null default now(), media_id text, phash text, primary key(chat_id,message_id));
 CREATE INDEX IF NOT EXISTS messages_user ON messages(user_id,created_at);
@@ -184,6 +187,7 @@ CREATE TABLE IF NOT EXISTS vip_registered_chats (
   registered_by bigint NOT NULL,
   registered_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE vip_registered_chats ADD COLUMN IF NOT EXISTS title text;
 CREATE TABLE IF NOT EXISTS vip_invite_claims (
   user_id bigint NOT NULL,
   vip_id bigint NOT NULL REFERENCES vip(id) ON DELETE CASCADE,

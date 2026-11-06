@@ -21,14 +21,16 @@ from telegram.constants import ChatMemberStatus
 from telegram.error import TelegramError
 from telegram.ext import (Application, CallbackQueryHandler, ChatMemberHandler, ChatJoinRequestHandler,
                           CommandHandler, ContextTypes, MessageHandler, filters)
-from onboarding import admin_status, bot_permission_gaps, can_request_activation, activation_text
+from onboarding import admin_status, bot_permission_gaps, can_request_activation, activation_text, member_present
 from logic import automatic_open, countdown_due, countdown_label, next_boundary, safe_name
+from schedule_policy import planned_state, teaser_boundary
 from commerce_ui import (vip_catalog_view, vip_confirm_view, payment_methods_view, money, payment_total,
                          invite_dashboard_view, leaderboard_view)
 from html import escape
 from admin_ui import PRESET_SLOTS, POST_INTERVALS, parse_slot, parse_euros, parse_user_id, short, bool_label
 from decimal import Decimal, InvalidOperation
 from vip_rules import goal_progress, raffle_eligible, is_claimable
+from activity import record_activity, inactive_candidates, record_warning, clear_warning
 from media_guard import from_message
 from media_pipeline import (id_is_banned, id_previously_seen, mark_message,
                             background_scan, ban_known_media, ban_from_message)
@@ -68,13 +70,13 @@ OPEN_PERMS=ChatPermissions(can_send_messages=True, can_send_photos=True,can_send
                             can_add_web_page_previews=False)
 CLOSED_PERMS=ChatPermissions(can_send_messages=False,can_send_photos=False,can_send_videos=False)
 DEFAULTS={'auto_enabled':'true','manual_until':'','manual_closed_until':'','open_state':'false',
-          'countdown_id':'','countdown_key':'','last_transition':'','rules':'Respectez les membres. Aucun lien ni story. Photos, vidéos et textes seulement.',
+          'countdown_id':'','countdown_key':'','status_id':'','service_id':'','last_transition':'','rules':'Respectez les membres. Aucun lien ni story. Photos, vidéos et textes seulement.',
           'rules_id':'','last_rules':'','allow_forwards':'false','ban_nonlatin':'true','last_admin_alert':'',
           'net_entries':'0','net_exits':'0','vip_ad_enabled':'false',
           'group_activation':'inactive','group_activation_nonce':'','group_activation_message_id':'',
           'group_activation_by':'','group_activation_confirmed_by':'','anti_repost_enabled':'false',
           'anti_fast_join_enabled':'false','anti_fast_join_minutes':'5','last_media_retention':'',
-          'raffle_min_credits':'1'}
+          'raffle_min_credits':'1','inactive_enabled':'false','opening_serial':'0'}
 
 def utcnow():return datetime.now(timezone.utc)
 
@@ -151,10 +153,11 @@ async def setup_prompt(bot,db,chat,actor):
         [InlineKeyboardButton('❌ Annuler et retirer le bot',callback_data=f'onb:no:{nonce}')]
     ])
     text=activation_text(chat.title or 'Supergroupe',gaps)
-    old=await cfg(db,'group_activation_message_id')
+    old=await cfg(db,'service_id') or await cfg(db,'group_activation_message_id')
     if old:
         try:
             await bot.edit_message_text(chat_id=chat.id,message_id=int(old),text=text,reply_markup=kb)
+            await setcfg(db,'group_activation_message_id',old)
             return True
         except (TelegramError, ValueError):pass
     try:
@@ -173,6 +176,59 @@ async def is_registered_vip_destination(ctx, chat_id):
         if await pool.fetchval('SELECT 1 FROM vip_registered_chats WHERE chat_id=$1',chat_id):
             return True
     return False
+
+async def prompt_group_role(ctx,chat):
+    """A new chat chooses its role from buttons; no numeric ID is requested."""
+    rows=[[InlineKeyboardButton('🛡 Groupe principal',callback_data='role:main')]]
+    rows += [[InlineKeyboardButton(f'💎 VIP du groupe {i}',callback_data=f'role:vip:{gid}')]
+             for i,gid in enumerate(GROUPS,1)]
+    text='Quel est le rôle de ce supergroupe ? Choisis ci-dessous. Seul le propriétaire peut associer un groupe VIP.'
+    pending=ctx.application.bot_data.setdefault('role_prompts',{})
+    old=pending.get(chat.id)
+    if old:
+        try:
+            await ctx.bot.edit_message_text(text,chat_id=chat.id,message_id=old,
+                                            reply_markup=InlineKeyboardMarkup(rows))
+            return
+        except TelegramError:pass
+    msg=await ctx.bot.send_message(chat.id,text,reply_markup=InlineKeyboardMarkup(rows))
+    pending[chat.id]=msg.message_id
+
+async def group_role_callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query
+    if not q or not q.message or q.message.chat.type!='supergroup':return
+    chat=q.message.chat
+    if not await telegram_group_admin(ctx.bot,chat.id,q.from_user):
+        await q.answer('Réservé aux administrateurs du groupe.',show_alert=True);return
+    data=q.data or ''
+    if data=='role:main':
+        if await is_registered_vip_destination(ctx,chat.id):
+            await q.answer('Ce groupe est déjà déclaré VIP.',show_alert=True);return
+        db=await register_group(ctx.application,chat.id,chat.title or str(chat.id))
+        select_group(chat.id,GROUPS)
+        await q.answer('Groupe principal sélectionné.')
+        await setcfg(db,'group_activation_message_id',q.message.message_id)
+        await setup_prompt(ctx.bot,db,chat,q.from_user)
+    elif data.startswith('role:vip:'):
+        if not is_owner(q.from_user.id):
+            await q.answer('Seul le propriétaire peut associer un groupe VIP.',show_alert=True);return
+        try:parent=int(data.rsplit(':',1)[1])
+        except ValueError:parent=0
+        if parent not in GROUPS or chat.id in GROUPS:
+            await q.answer('Choix de groupe invalide.',show_alert=True);return
+        if await is_registered_vip_destination(ctx,chat.id):
+            await q.answer('Groupe VIP déjà enregistré.',show_alert=True);return
+        member=await ctx.bot.get_chat_member(chat.id,ctx.bot.id)
+        if member.status not in ('administrator','creator'):
+            await q.answer('Accorde les droits admin au bot.',show_alert=True);return
+        await ctx.application.bot_data['pools'][parent].execute(
+            '''INSERT INTO vip_registered_chats(chat_id,registered_by,title) VALUES($1,$2,$3)
+               ON CONFLICT(chat_id) DO UPDATE SET title=EXCLUDED.title''',
+            chat.id,q.from_user.id,chat.title or str(chat.id))
+        await q.answer('Groupe VIP détecté.')
+        await q.edit_message_text('💎 Groupe VIP enregistré. Crée son offre depuis /panel en privé.')
+    else:
+        await q.answer('Choix inconnu.',show_alert=True)
 
 
 async def register_group(application, chat_id, title):
@@ -235,13 +291,16 @@ async def group_setup_command(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if chat.id not in GROUPS and await is_registered_vip_destination(ctx,chat.id):
         await msg.reply_text('💎 Destination VIP reconnue : les horaires normaux ne s’appliquent pas ici.')
         return
+    if chat.id not in GROUPS:
+        await quiet_delete(ctx.bot,chat.id,msg.message_id)
+        await prompt_group_role(ctx,chat)
+        return
     db=await register_group(ctx.application,chat.id,chat.title or str(chat.id))
     bind_group(update,ctx)
     await quiet_delete(ctx.bot,chat.id,msg.message_id)
     if await group_active(db):
         gaps=await group_rights(ctx.bot,chat.id)
         if not gaps:
-            await ctx.bot.send_message(chat.id,'✅ Bot déjà actif et droits valides.')
             return
         await deactivate_group(db)
     await setup_prompt(ctx.bot,db,chat,actor)
@@ -274,12 +333,9 @@ async def bot_membership_update(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
             try:await ctx.bot.send_message(chat.id,'⚠️ Convertis ce groupe en supergroupe pour activer le bot.')
             except TelegramError:pass
             return
-        try:
-            await register_group(ctx.application,chat.id,chat.title or str(chat.id))
-        except Exception:
-            log.exception('Could not register detected group %s',chat.id)
-            await notify_owner(ctx.bot,f'⚠️ Enregistrement PostgreSQL impossible : {chat.id}')
-            return
+        try:await prompt_group_role(ctx,chat)
+        except TelegramError:log.exception('Cannot show group role selection %s',chat.id)
+        return
     bind_group(update,ctx)
     db=await db_conn(ctx)
     if await group_active(db):
@@ -287,8 +343,7 @@ async def bot_membership_update(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         if not missing:return
         await deactivate_group(db)
         await notify_owner(ctx.bot,f'⚠️ Droits insuffisants sur {chat.title} ({chat.id}) : '+', '.join(missing))
-        try:await ctx.bot.send_message(chat.id,'⚠️ Droits manquants : modération suspendue. '
-                                                'Un administrateur doit relancer /setup.')
+        try:await setup_prompt(ctx.bot,db,chat,actor)
         except TelegramError:pass
         return
     if not await telegram_group_admin(ctx.bot,chat.id,actor):
@@ -353,18 +408,22 @@ async def activation_callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     await setcfg(db,'open_state','false')
     await setcfg(db,'group_activation_nonce','')
     await setcfg(db,'group_activation_confirmed_by',q.from_user.id)
+    await setcfg(db,'service_id',q.message.message_id)
     await q.answer('Activation confirmée.')
-    try:await q.edit_message_text('✅ Activation confirmée par un administrateur.\n'
-                                  '🛡 Droits vérifiés, modération et planification démarrées.')
-    except TelegramError:pass
     await notify_owner(ctx.bot,f'✅ Bot activé sur {chat.title} ({current_group()}) par {q.from_user.id}.')
     await tick(ctx)
+    if not await flag(db,'open_state'):
+        await quiet_delete(ctx.bot,current_group(),q.message.message_id)
+        msg=await ctx.bot.send_message(current_group(),await closure_text(db,utcnow()))
+        await setcfg(db,'status_id',msg.message_id)
+        await setcfg(db,'service_id','')
 
 async def quiet_delete(bot,chat_id,msg_id):
     try:
         await bot.delete_message(chat_id,msg_id)
         return True
-    except TelegramError:
+    except TelegramError as exc:
+        if 'message to delete not found' in str(exc).lower():return True
         return False
 
 async def notify_owner(bot,txt):
@@ -386,41 +445,53 @@ async def get_rows(db):
 
 async def is_open(db,now=None):
     now=now or utcnow()
-    closed=await cfg(db,'manual_closed_until')
-    if closed:
-        try:
-            if now<datetime.fromisoformat(closed):return False
-        except ValueError:pass
-    manual=await cfg(db,'manual_until')
-    if manual:
-        try:
-            if now<datetime.fromisoformat(manual):return True
-        except ValueError:pass
-    return await flag(db,'auto_enabled') and automatic_open(now,await get_rows(db),TZ)
+    def parse(value):
+        try:return datetime.fromisoformat(value) if value else None
+        except ValueError:return None
+    return planned_state(now,await get_rows(db),TZ,await flag(db,'auto_enabled'),
+                         parse(await cfg(db,'manual_until')),parse(await cfg(db,'manual_closed_until')))
 
 async def send_countdown(bot,db,txt,key):
     if await cfg(db,'countdown_key')==key:return
     old=await cfg(db,'countdown_id')
-    if old:await quiet_delete(bot,current_group(),int(old))
-    try:
-        msg=await bot.send_message(current_group(),txt)
-        await setcfg(db,'countdown_id',msg.message_id)
-        await setcfg(db,'countdown_key',key)
-    except TelegramError:log.exception('countdown')
+    if old:
+        if not await quiet_delete(bot,current_group(),int(old)):
+            log.warning('Old countdown could not be removed in %s; new countdown deferred',current_group())
+            return
+        await setcfg(db,'countdown_id','')
+    msg=await bot.send_message(current_group(),txt)
+    await setcfg(db,'countdown_id',msg.message_id)
+    await setcfg(db,'countdown_key',key)
 
 async def clean_open_messages(bot,db):
     # Telegram's normal deletion is time-limited; old messages stay on server.
-    rows=await db.fetch('SELECT message_id FROM messages WHERE chat_id=$1 AND created_at>now()-interval \'48 hours\' ORDER BY message_id DESC LIMIT 10000',current_group())
-    # Keep failed deletions available for retry on the next closure.
-    for chunk_start in range(0,len(rows),40):
-        batch=rows[chunk_start:chunk_start+40]
-        gate=asyncio.Semaphore(4)
-        async def remove(row):
-            async with gate:
-                return row['message_id'] if await quiet_delete(bot,current_group(),row['message_id']) else None
-        removed=await asyncio.gather(*(remove(row) for row in batch))
-        ids=[mid for mid in removed if mid is not None]
-        if ids:await db.execute('DELETE FROM messages WHERE chat_id=$1 AND message_id=ANY($2::bigint[])',current_group(),ids)
+    cursor=None
+    failed=0
+    while True:
+        rows=await db.fetch('''SELECT message_id FROM messages
+            WHERE chat_id=$1 AND created_at>now()-interval '48 hours'
+              AND ($2::bigint IS NULL OR message_id<$2)
+            ORDER BY message_id DESC LIMIT 400''',current_group(),cursor)
+        if not rows:break
+        cursor=rows[-1]['message_id']
+        for chunk_start in range(0,len(rows),40):
+            batch=rows[chunk_start:chunk_start+40]
+            gate=asyncio.Semaphore(4)
+            async def remove(row):
+                async with gate:
+                    return row['message_id'] if await quiet_delete(bot,current_group(),row['message_id']) else None
+            removed=await asyncio.gather(*(remove(row) for row in batch))
+            ids=[mid for mid in removed if mid is not None]
+            failed+=len(batch)-len(ids)
+            if ids:await db.execute('DELETE FROM messages WHERE chat_id=$1 AND message_id=ANY($2::bigint[])',current_group(),ids)
+    if failed:
+        log.warning('Could not delete %s tracked member messages in group %s',failed,current_group())
+
+async def clean_temporary_notices(bot,db):
+    rows=await db.fetch('SELECT message_id FROM temporary_notices WHERE expires_at<=now() LIMIT 100')
+    for row in rows:
+        if await quiet_delete(bot,current_group(),row['message_id']):
+            await db.execute('DELETE FROM temporary_notices WHERE message_id=$1',row['message_id'])
 
 async def remove_rules(bot,db):
     rid=await cfg(db,'rules_id')
@@ -439,22 +510,55 @@ async def closure_text(db,now):
         return '🔴 Groupe fermé. Aucun horaire de réouverture programmé.'
     return '🔴 Groupe fermé. Prochaine ouverture : '+target.strftime('%d/%m à %H:%M')+f' ({TZ}).'
 
+async def process_inactivity(bot,db,chat_id):
+    if not await flag(db,'inactive_enabled'):return
+    session=int(await cfg(db,'opening_serial','0'))
+    if session<1:return
+    cursor=0
+    while True:
+        rows=await inactive_candidates(db,session,cursor)
+        if not rows:break
+        for row in rows:
+            cursor=row['user_id']
+            if await trusted(db,cursor):continue
+            eligible=row['warned_serial'] is not None and row['warned_serial']<session
+            await record_warning(db,cursor,session,eligible)
+            if not eligible:
+                try:await bot.send_message(cursor,'⚠️ Participe à la prochaine ouverture du groupe pour conserver ton accès.')
+                except TelegramError:log.info('Cannot DM inactivity notice to %s',cursor)
+        if len(rows)<200:break
+
 async def transition(bot,db,opened):
     await bot.set_chat_permissions(current_group(),OPEN_PERMS if opened else CLOSED_PERMS,
                                    use_independent_chat_permissions=True)
+    if not opened:
+        await process_inactivity(bot,db,current_group())
     await setcfg(db,'open_state',str(opened).lower())
     await setcfg(db,'last_transition',utcnow().isoformat())
-    old=await cfg(db,'countdown_id')
-    if old:await quiet_delete(bot,current_group(),int(old))
+    for key in ('countdown_id','status_id','service_id'):
+        old=await cfg(db,key)
+        if old:await quiet_delete(bot,current_group(),int(old))
+        await setcfg(db,key,'')
     await setcfg(db,'countdown_id','')
     await setcfg(db,'countdown_key','')
     if opened:
-        await bot.send_message(current_group(),'🟢 Groupe ouvert ! Vous pouvez envoyer du texte, des photos et des vidéos.')
+        await db.execute("UPDATE config SET value=(value::bigint+1)::text WHERE key='opening_serial'")
+        msg=await bot.send_message(current_group(),'🟢 Groupe ouvert ! Vous pouvez envoyer du texte, des photos et des vidéos.')
+        await setcfg(db,'status_id',msg.message_id)
         await publish_rules(bot,db)
     else:
         await remove_rules(bot,db)
+        notices=await db.fetch('SELECT message_id FROM temporary_notices')
+        for notice in notices:
+            if await quiet_delete(bot,current_group(),notice['message_id']):
+                await db.execute('DELETE FROM temporary_notices WHERE message_id=$1',notice['message_id'])
+        legacy_posts=await db.fetch('SELECT id,last_message_id FROM posts WHERE last_message_id IS NOT NULL')
+        for post in legacy_posts:
+            if await quiet_delete(bot,current_group(),post['last_message_id']):
+                await db.execute('UPDATE posts SET last_message_id=NULL WHERE id=$1',post['id'])
         await clean_open_messages(bot,db)
-        await bot.send_message(current_group(),await closure_text(db,utcnow()))
+        msg=await bot.send_message(current_group(),await closure_text(db,utcnow()))
+        await setcfg(db,'status_id',msg.message_id)
 
 async def publish_rules(bot,db):
     await remove_rules(bot,db)
@@ -463,30 +567,32 @@ async def publish_rules(bot,db):
         return
     msg=await bot.send_message(current_group(),'📌 Règles du groupe\n\n'+await cfg(db,'rules'))
     try:await bot.pin_chat_message(current_group(),msg.message_id,disable_notification=True)
-    except TelegramError:pass
+    except TelegramError:log.warning('Could not pin rules in %s',current_group())
     await setcfg(db,'rules_id',msg.message_id)
     await setcfg(db,'last_rules',utcnow().isoformat())
 
 async def send_post(bot,db,post):
     old=post['last_message_id']
-    if old:await quiet_delete(bot,current_group(),old)
+    if old and not await quiet_delete(bot,current_group(),old):
+        log.warning('Previous advertisement cannot be removed in %s; replacement deferred',current_group())
+        return
     markup=None
     if post['kind']=='vip':
         identity=await bot.get_me()
         if not identity.username:
             log.warning('Bot username unavailable for VIP advert');return
-        markup=InlineKeyboardMarkup([[InlineKeyboardButton('💎 Choisir mes VIP',url=f'https://t.me/{identity.username}?start={vip_payload(current_group(),"vip")}')]])
+        markup=InlineKeyboardMarkup([[InlineKeyboardButton('💎 Voir les VIP',url=f'https://t.me/{identity.username}?start={vip_payload(current_group(),"vip")}')]])
     elif post['kind']=='invite':
         identity=await bot.get_me()
         if not identity.username:
             log.warning('Bot username unavailable for invite advert');return
-        markup=InlineKeyboardMarkup([[InlineKeyboardButton('🔗 Recevoir mon lien personnel',url=f'https://t.me/{identity.username}?start={vip_payload(current_group(),"invite")}')]])
+        markup=InlineKeyboardMarkup([[InlineKeyboardButton('🔗 Mon lien d’invitation',url=f'https://t.me/{identity.username}?start={vip_payload(current_group(),"invite")}')]])
     elif post['button_text'] and post['button_url']:
         markup=InlineKeyboardMarkup([[InlineKeyboardButton(post['button_text'],url=post['button_url'])]])
     try:
         if post['photo_file_id']:
-            msg=await bot.send_photo(current_group(),post['photo_file_id'],caption=post['body'],reply_markup=markup)
-        else:msg=await bot.send_message(current_group(),post['body'],reply_markup=markup)
+            msg=await bot.send_photo(current_group(),post['photo_file_id'],caption=post['body'][:1024],reply_markup=markup)
+        else:msg=await bot.send_message(current_group(),post['body'][:4096],reply_markup=markup)
         await db.execute('UPDATE posts SET last_message_id=$1,last_sent_at=now() WHERE id=$2',msg.message_id,post['id'])
     except TelegramError:log.exception('post %s',post['id'])
 
@@ -506,11 +612,15 @@ async def _tick_locked(ctx):
                                 +', '.join(missing)+'. /setup pour réactiver.')
         return
     try:
+        await clean_temporary_notices(bot,db)
         open_now=await is_open(db,now)
         old=await flag(db,'open_state')
         if old!=open_now:await transition(bot,db,open_now)
         if not open_now and await cfg(db,'rules_id'):
             await remove_rules(bot,db)
+        if not open_now and old==open_now and await db.fetchval('''SELECT 1 FROM messages
+             WHERE chat_id=$1 AND created_at>now()-interval '48 hours' LIMIT 1''',current_group()):
+            await clean_open_messages(bot,db)
         manual=await cfg(db,'manual_until')
         if manual:
             end=datetime.fromisoformat(manual)
@@ -524,27 +634,37 @@ async def _tick_locked(ctx):
             last=await cfg(db,'last_rules')
             if not last or (now-datetime.fromisoformat(last)).total_seconds()>=1800:await publish_rules(bot,db)
             posts=await db.fetch('SELECT * FROM posts WHERE enabled=true')
-            for p in posts:
-                if not p['last_sent_at'] or (now-p['last_sent_at']).total_seconds()>=p['interval_minutes']*60:
-                    await send_post(bot,db,p)
+            due=[p for p in posts if not p['last_sent_at'] or
+                 (now-p['last_sent_at']).total_seconds()>=p['interval_minutes']*60]
+            if due:
+                await send_post(bot,db,min(due,key=lambda p:p['last_sent_at'] or datetime.min.replace(tzinfo=timezone.utc)))
         rows=await get_rows(db)
         manual_closed=await cfg(db,'manual_closed_until')
         manual_open=await cfg(db,'manual_until')
         override_active=any(datetime.fromisoformat(value)>now for value in (manual_closed,manual_open) if value)
-        if override_active or not await flag(db,'auto_enabled'):
+        if override_active:
             old_countdown=await cfg(db,'countdown_id')
             if old_countdown:await quiet_delete(bot,current_group(),int(old_countdown))
             await setcfg(db,'countdown_id','')
             await setcfg(db,'countdown_key','')
-        if rows and await flag(db,'auto_enabled') and not override_active:
-            kind='close' if open_now else 'open'
+        automatic=await flag(db,'auto_enabled')
+        if rows and not override_active:
+            kind='close' if open_now and automatic else 'open'
             target=next_boundary(now,rows,kind,TZ)
-            if target:
+            if target and (automatic or not automatic_open(now,rows,TZ)):
                 secs=(target-now.astimezone(ZoneInfo(TZ))).total_seconds()
                 if 0<secs<=48*3600 and countdown_due(secs):
                     if open_now:txt=f'⏳ Le groupe fermera dans {countdown_label(secs)}.'
                     else:txt=f'⏳ Le groupe ouvrira dans {countdown_label(secs)}.'
                     await send_countdown(bot,db,txt,f'{kind}:{target.isoformat()}:{round(secs/60)}')
+            if not automatic:
+                boundary=teaser_boundary(now,rows,TZ)
+                if boundary and await cfg(db,'last_teaser')!=boundary.isoformat():
+                    old_countdown=await cfg(db,'countdown_id')
+                    if old_countdown:await quiet_delete(bot,current_group(),int(old_countdown))
+                    msg=await bot.send_message(current_group(),'🔴 Le groupe reste fermé. Restez branchés jusqu’à la prochaine ouverture.')
+                    await setcfg(db,'countdown_id',msg.message_id)
+                    await setcfg(db,'last_teaser',boundary.isoformat())
         # Credit referred members only after five minutes, if still in the group.
         referrals=await db.fetch("SELECT user_id FROM referrals WHERE credited=false AND active=true AND joined_at<now()-interval '5 minutes' LIMIT 100")
         for r in referrals:
@@ -560,6 +680,8 @@ async def _tick_locked(ctx):
             await db.execute("DELETE FROM messages WHERE created_at<now()-interval '7 days'")
             await db.execute("DELETE FROM member_recent_joins WHERE observed_join_at<now()-interval '2 days'")
             await db.execute("DELETE FROM trusted_actions WHERE created_at<now()-interval '90 days'")
+            await db.execute("DELETE FROM events WHERE created_at<now()-interval '90 days'")
+            await db.execute("DELETE FROM member_activity WHERE opening_serial < (SELECT value::bigint FROM config WHERE key='opening_serial')-3")
             await db.execute("""DELETE FROM media_catalog WHERE last_seen<now()-interval '90 days'
                  AND NOT EXISTS(SELECT 1 FROM media_ban_keys b WHERE b.key=media_catalog.unique_id)""")
             await setcfg(db,'last_media_retention',now.isoformat())
@@ -570,8 +692,8 @@ async def join_update(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     cm=update.chat_member
     if not cm or cm.chat.id!=current_group():return
     old,new=cm.old_chat_member,cm.new_chat_member
-    before=old.status not in ('left','kicked')
-    after=new.status not in ('left','kicked')
+    before=member_present(old)
+    after=member_present(new)
     if before==after:return
     db=await db_conn(ctx)
     if not await group_active(db):return
@@ -601,6 +723,16 @@ async def join_update(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         await db.execute('DELETE FROM member_recent_joins WHERE user_id=$1',user.id)
         await db.execute("INSERT INTO events(user_id,kind) VALUES($1,'leave')",user.id)
         await db.execute("UPDATE config SET value=(value::bigint+1)::text WHERE key='net_exits'")
+
+async def pinned_notice(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    msg=update.effective_message
+    if msg and msg.pinned_message and msg.chat_id in GROUPS:
+        await quiet_delete(ctx.bot,msg.chat_id,msg.message_id)
+
+async def service_notice(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    msg=update.effective_message
+    if msg and msg.chat_id in GROUPS:
+        await quiet_delete(ctx.bot,msg.chat_id,msg.message_id)
 
 async def inspect_media(ctx,db,msg):
     """Fast exact ID check, then bounded async hashing in the background.
@@ -632,12 +764,15 @@ async def inspect_media(ctx,db,msg):
         update=None,name=f'media:{msg.message_id}')
     return False
 
-async def warn_link(bot,uid,name):
-    m=await bot.send_message(current_group(),f'🚫 Les liens sont interdits dans ce groupe. {name[:55]} a été banni.')
-    async def delayed():
+async def warn_link(bot,db,uid,name):
+    chat_id=current_group()
+    msg=await bot.send_message(chat_id,f'🚫 Les liens sont interdits dans ce groupe. {name[:55]} a été banni.')
+    await db.execute("INSERT INTO temporary_notices(message_id,expires_at) VALUES($1,now()+interval '30 seconds') ON CONFLICT DO NOTHING",msg.message_id)
+    async def expire():
         await asyncio.sleep(30)
-        await quiet_delete(bot,current_group(),m.message_id)
-    asyncio.create_task(delayed())
+        if await quiet_delete(bot,chat_id,msg.message_id):
+            await db.execute('DELETE FROM temporary_notices WHERE message_id=$1',msg.message_id)
+    asyncio.create_task(expire())
 
 async def report_action(bot,db,target,ban_user=True):
     """Track moderator evidence first, then act, then clean up in parallel.
@@ -651,26 +786,38 @@ async def report_action(bot,db,target,ban_user=True):
         count=await db.fetchval('UPDATE members SET minor_strikes=minor_strikes+1 WHERE user_id=$1 RETURNING minor_strikes',target)
         if count and count>=2:await ban(bot,target)
         else:await mute(bot,db,target,3)
-    ids=await db.fetch("""SELECT message_id FROM messages
-                          WHERE user_id=$1 AND chat_id=$2 AND created_at>now()-interval '48 hours'
-                          ORDER BY message_id DESC LIMIT 10000""",target,current_group())
     semaphore=asyncio.Semaphore(4)
     async def remove(mid):
-        async with semaphore:await quiet_delete(bot,current_group(),mid)
-    await asyncio.gather(*(remove(r['message_id']) for r in ids))
+        async with semaphore:return mid if await quiet_delete(bot,current_group(),mid) else None
+    cursor=None
+    while True:
+        ids=await db.fetch("""SELECT message_id FROM messages
+            WHERE user_id=$1 AND chat_id=$2 AND created_at>now()-interval '48 hours'
+              AND ($3::bigint IS NULL OR message_id<$3)
+            ORDER BY message_id DESC LIMIT 400""",target,current_group(),cursor)
+        if not ids:break
+        cursor=ids[-1]['message_id']
+        removed=await asyncio.gather(*(remove(row['message_id']) for row in ids))
+        done=[mid for mid in removed if mid is not None]
+        if done:await db.execute('DELETE FROM messages WHERE chat_id=$1 AND message_id=ANY($2::bigint[])',current_group(),done)
 
 async def on_message(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     bind_group(update,ctx)
     msg=update.effective_message
-    if not msg or msg.chat_id not in GROUPS or msg.chat_id!=current_group() or not msg.from_user or msg.from_user.is_bot:return
+    if not msg or msg.chat_id not in GROUPS or msg.chat_id!=current_group():return
     db=await db_conn(ctx)
     if not await group_active(db):return
+    if msg.from_user and msg.from_user.id==ctx.bot.id:return
+    # Track every non-service message, including anonymous administrators and
+    # other bots, before skipping moderation that requires a human account.
+    await db.execute('INSERT INTO messages(chat_id,message_id,user_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',
+                     current_group(),msg.message_id,msg.from_user.id if msg.from_user else 0)
+    if not msg.from_user or msg.from_user.is_bot:return
     u=msg.from_user
     admin=await trusted(db,u.id)
     text=msg.text or msg.caption or ''
     # Store for post-close cleanup and per-user moderation.
     await db.execute('INSERT INTO members(user_id,display_name,username,joined_at) VALUES($1,$2,$3,now()) ON CONFLICT(user_id) DO UPDATE SET display_name=$2,username=$3',u.id,u.full_name,u.username)
-    await db.execute('INSERT INTO messages(chat_id,message_id,user_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',current_group(),msg.message_id,u.id)
     if text.startswith('/'):
         if not admin:
             await quiet_delete(ctx.bot,current_group(),msg.message_id)
@@ -736,7 +883,9 @@ async def on_message(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
             elif command in ('/pedo','/mineur'):
                 await report_action(ctx.bot,db,target_uid,command=='/pedo')
             return
-    if admin:return
+    if admin:
+        if msg.photo or msg.video:await inspect_media(ctx,db,msg)
+        return
     if not await is_open(db):
         await quiet_delete(ctx.bot,current_group(),msg.message_id);return
     if msg.forward_origin and not await flag(db,'allow_forwards'):
@@ -745,7 +894,7 @@ async def on_message(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if has_link or msg.story:
         await quiet_delete(ctx.bot,current_group(),msg.message_id)
         await ban(ctx.bot,u.id)
-        await warn_link(ctx.bot,u.id,u.full_name)
+        await warn_link(ctx.bot,db,u.id,u.full_name)
         return
     # Supported: text/photo/video only; reject every other message type.
     if not (msg.text or msg.photo or msg.video):
@@ -759,17 +908,28 @@ async def on_message(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if text.strip().casefold()=='@admin' and msg.reply_to_message and msg.reply_to_message.from_user:
         target=msg.reply_to_message.from_user.id
         await quiet_delete(ctx.bot,current_group(),msg.message_id)
+        if not (msg.reply_to_message.photo or msg.reply_to_message.video):return
         if target==u.id or await trusted(db,target):return
         await db.execute('INSERT INTO mod_reports(message_id,reporter_id,target_user_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',msg.reply_to_message.message_id,u.id,target)
         reports=await db.fetchval('SELECT count(*) FROM mod_reports WHERE message_id=$1',msg.reply_to_message.message_id)
         if reports>=3:
             await report_action(ctx.bot,db,target,True)
             await db.execute('DELETE FROM mod_reports WHERE message_id=$1',msg.reply_to_message.message_id)
-            await ctx.bot.send_message(current_group(),'✅ Signalement traité. Merci aux membres ayant alerté la modération.')
+            note=await ctx.bot.send_message(current_group(),'✅ Merci pour votre vigilance. Le signalement a été traité.')
+            await db.execute("INSERT INTO temporary_notices(message_id,expires_at) VALUES($1,now()+interval '30 seconds') ON CONFLICT DO NOTHING",note.message_id)
+            async def expire_note(chat_id,mid):
+                await asyncio.sleep(30)
+                if await quiet_delete(ctx.bot,chat_id,mid):
+                    await db.execute('DELETE FROM temporary_notices WHERE message_id=$1',mid)
+            ctx.application.create_task(expire_note(current_group(),note.message_id))
         return
     await db.execute('UPDATE members SET messages=messages+1 WHERE user_id=$1',u.id)
     if msg.photo or msg.video:
-        await inspect_media(ctx,db,msg)
+        if await inspect_media(ctx,db,msg):return
+    session=int(await cfg(db,'opening_serial','0'))
+    if session:
+        await record_activity(db,u.id,session)
+        await clear_warning(db,u.id)
 
 # OWNER PANEL V5: every navigation/choice uses Telegram inline buttons.
 # Text or photo is requested only where a free-form value is inherently necessary.
@@ -809,8 +969,23 @@ async def display_admin(ctx, page, *, q=None, msg=None, offset=0):
                [('💎 VIP','vips',None),('🧾 Commandes','orders',None)],
                [('🧬 Empreintes','media',None),('🩺 Santé','health',None)],
                [('📌 Règles','rules',None),('📊 Statistiques','stats',None)],
+               [('😴 Inactifs','inactive',None)],
                [('🏆 Tirage au sort','raffle',None)],
                [('♻️ Actualiser','home',None),('✖️ Fermer','dismiss',None)] ]
+    elif page=='inactive':
+        enabled=await flag(db,'inactive_enabled')
+        pending=await db.fetchval('SELECT count(*) FROM inactivity_warnings WHERE eligible=true')
+        average=await db.fetchval('''SELECT EXTRACT(epoch FROM avg(now()-m.joined_at))/86400
+              FROM inactivity_warnings w JOIN members m ON m.user_id=w.user_id
+              WHERE w.eligible=true AND m.left_at IS NULL''')
+        text=(f'😴 <b>INACTIVITÉ</b> · {bool_label(enabled)}\n'
+              f'Purge éligible : {pending}\n'
+              f'Ancienneté moyenne : {float(average or 0):.1f} jours\n\n'
+              'Un membre suivi sans message pendant une ouverture reçoit un avertissement privé. '
+              'Après une autre ouverture sans participation, il devient éligible à la purge. '
+              'Un membre purgé qui revient est banni. Les anciens membres non observés ne sont pas recensés.')
+        rows=[[(('Désactiver' if enabled else 'Activer')+' le suivi',f'inactive:{0 if enabled else 1}',None)],
+              [('🧹 Purger les éligibles', 'confirm:purge', 'danger')],back_row()]
     elif page=='groups':
         text='🌍 <b>GROUPES AUTORISÉS</b>\n\nChoisis le groupe à administrer. Les réglages et les membres sont isolés.'
         rows=[]
@@ -841,18 +1016,18 @@ async def display_admin(ctx, page, *, q=None, msg=None, offset=0):
         names=await db.fetch('SELECT pattern FROM banned_names ORDER BY pattern LIMIT 80')
         text=(f'🛡 <b>MODÉRATION</b>\n'
               f'↪️ Forwards : {bool_label(forwards)}\n'
-              f'🔤 Filtre alphabet : {bool_label(nonlatin)}\n'
+              f'🔤 Noms en alphabet latin : {bool_label(nonlatin)} (bannit à l’entrée les noms contenant des lettres non latines)\n'
               f'♻️ Anti-repost : {bool_label(repost)}\n'
-              f'🚷 Anti-publication immédiate : {bool_label(fastjoin)} ({fastmins} min)\n'
+              f'🚷 Anti-média des nouveaux membres : {bool_label(fastjoin)} ({fastmins} min après l’arrivée ; bannissement si photo/vidéo)\n'
               f'⛔ Mots interdits : {len(words)} affichés\n'
               f'🚫 Noms interdits : {len(names)} affichés')
         rows=[ [('↪️ Forwards ON' if not forwards else '↪️ Forwards OFF',
                   f'set:forwards:{0 if forwards else 1}',None)],
-               [('🔤 Filtre alphabet ON' if not nonlatin else '🔤 Filtre alphabet OFF',
+               [('🔤 Noms latins ON' if not nonlatin else '🔤 Noms latins OFF',
                   f'set:nonlatin:{0 if nonlatin else 1}',None)],
                [('♻️ Anti-repost ' + ('OFF' if repost else 'ON'),
                   f'set:repost:{0 if repost else 1}',None)],
-               [('🚷 Anti-publication ' + ('OFF' if fastjoin else 'ON'),
+               [('🚷 Anti-média nouveaux ' + ('OFF' if fastjoin else 'ON'),
                   f'set:fastjoin:{0 if fastjoin else 1}',None)],
                [('⏱ 1 min','fastmins:1',None),('3 min','fastmins:3',None),('5 min','fastmins:5',None)],
                [('⏱ 10 min','fastmins:10',None),('15 min','fastmins:15',None)],
@@ -980,7 +1155,10 @@ async def display_admin(ctx, page, *, q=None, msg=None, offset=0):
                           (f' · 🎯 {v["invite_goal"]} invitations' if v['invite_goal'] else '') +
                           (' · 24/24' if v['always_open'] else '')
                           for v in offers[offset:offset+10]) or 'Aucun VIP.'
-        rows=[[('➕ Ajouter une offre','ask:vipchat','success')]]
+        detected=await db.fetch('SELECT chat_id,title FROM vip_registered_chats ORDER BY registered_at DESC LIMIT 30')
+        rows=[[(f'➕ {short(r["title"] or str(r["chat_id"]),30)}',f'vipchat:{r["chat_id"]}','success')]
+              for r in detected]
+        if not detected:text+='\n\nAjoute le bot comme admin au groupe VIP, puis choisis son rôle dans ce groupe.'
         for v in offers[offset:offset+10]:
             rows.append([(f'{"⏸ OFF" if v["enabled"] else "▶️ ON"} #{v["id"]}',f'viptoggle:{v["id"]}',None),
                          ('💶 Prix',f'vipprice:{v["id"]}',None),
@@ -1152,15 +1330,14 @@ async def admin_callbacks(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         await q.answer('Saisie annulée.');await display_admin(ctx,'home',q=q);return
     if data.startswith('ask:'):
         mode=data.split(':')[1]
-        if mode not in ('schedule','word','name','trusted','rules','vipchat'):
+        if mode not in ('schedule','word','name','trusted','rules'):
             await q.answer('Action inconnue.',show_alert=True);return
         ctx.user_data['adm_pending']={'mode':mode}
         info={'schedule':'deux horaires, par exemple <code>22:00 00:00</code>',
               'word':'le <b>mot interdit</b> à ajouter',
               'name':'le <b>texte interdit dans les noms</b> à ajouter',
               'trusted':'l’<b>ID numérique</b> du trusted user',
-              'rules':'les <b>règles complètes du groupe</b>',
-              'vipchat':'l’<b>ID du groupe VIP</b> (ex. -1001234567890)'}
+              'rules':'les <b>règles complètes du groupe</b>'}
         await q.answer()
         await show_screen(q,'✏️ Envoie '+info[mode]+'.\n\nAucune commande à taper.',
                           owner_kb([[('✖️ Annuler','cancel',None)]]),edit=True)
@@ -1208,6 +1385,16 @@ async def admin_callbacks(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         await q.answer()
         await show_screen(q,f'🎯 Combien d’invitations validées pour débloquer le VIP #{vid} ?\n'
                             'Envoie un nombre entier, ou 0 pour désactiver.',
+                          owner_kb([[('✖️ Annuler','cancel',None)]]),edit=True)
+        return
+    if data.startswith('vipchat:'):
+        try:chat_id=int(data.split(':')[1])
+        except ValueError:chat_id=0
+        if not await db.fetchval('SELECT 1 FROM vip_registered_chats WHERE chat_id=$1',chat_id):
+            await q.answer('Groupe VIP non détecté.',show_alert=True);return
+        ctx.user_data['adm_pending']={'mode':'viptitle','chat_id':chat_id}
+        await q.answer()
+        await show_screen(q,'💎 Envoie le nom de cette offre VIP.',
                           owner_kb([[('✖️ Annuler','cancel',None)]]),edit=True)
         return
     if data.startswith('vip247:'):
@@ -1261,7 +1448,8 @@ async def admin_callbacks(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
                 'close':'Fermer immédiatement le groupe ?',
                 'resume':'Revenir à la planification automatique ?',
                 'pubrules':'Publier et épingler les règles maintenant ?',
-                'raffle':'Tirer un gagnant au hasard parmi les participants éligibles ?'}
+                'raffle':'Tirer un gagnant au hasard parmi les participants éligibles ?',
+                'purge':'Exclure les membres éligibles sans ban permanent immédiat ? Ils seront bannis s’ils reviennent.'}
         if action.startswith('banmedia:'):labels[action]='Bannir toutes les empreintes de ce média (et de son album si connu) ?'
         if action.startswith('delslot:'):labels[action]='Supprimer ce créneau horaire ?'
         if action.startswith('rmfilter:'):labels[action]='Supprimer ce filtre de modération ?'
@@ -1293,6 +1481,7 @@ async def admin_callbacks(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         return
     if data.startswith('do:'):
         action=data[3:];destination='home'
+        callback_answered=False
         if action in ('open','close','resume') and not await group_active(db):
             await q.answer('Le groupe doit être activé via /setup.',show_alert=True);return
         if action=='open':
@@ -1311,6 +1500,25 @@ async def admin_callbacks(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
                 await q.answer('Aucun participant éligible.',show_alert=True);return
             await notify_owner(ctx.bot,f'🎲 Tirage groupe {current_group()} : gagnant {winner["user_id"]} ({winner["n"]} invitations).')
             destination='raffle'
+        elif action=='purge':
+            await q.answer('Purge en cours…')
+            callback_answered=True
+            rows=await db.fetch('''SELECT w.user_id FROM inactivity_warnings w JOIN members m ON m.user_id=w.user_id
+                 WHERE w.eligible=true AND m.left_at IS NULL ORDER BY w.user_id LIMIT 100''')
+            removed=0
+            for row in rows:
+                uid=row['user_id']
+                try:
+                    await ctx.bot.ban_chat_member(current_group(),uid)
+                    await ctx.bot.unban_chat_member(current_group(),uid,only_if_banned=True)
+                except TelegramError:
+                    log.exception('Could not purge inactive member %s',uid)
+                    continue
+                await db.execute('UPDATE members SET removed_flag=true,left_at=now() WHERE user_id=$1',uid)
+                await db.execute('DELETE FROM inactivity_warnings WHERE user_id=$1',uid)
+                removed+=1
+            log.info('Purged %s inactive members in group %s',removed,current_group())
+            destination='inactive'
         elif action=='pubrules':
             if not await group_active(db) or not await is_open(db):
                 await q.answer('Ouvre le groupe avant de publier les règles.',show_alert=True)
@@ -1354,7 +1562,7 @@ async def admin_callbacks(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
             if not ok:await q.answer('Déjà traité ou justificatif manquant.',show_alert=True);return
             destination='orders'
         else:await q.answer('Inconnu.',show_alert=True);return
-        await q.answer('✅ Action appliquée.')
+        if not callback_answered:await q.answer('✅ Action appliquée.')
         if action in ('open','close','resume'):await tick(ctx)
         await display_admin(ctx,destination,q=q);return
     if data.startswith('slot:'):
@@ -1365,7 +1573,8 @@ async def admin_callbacks(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         await q.answer('Créneau ajouté.');await display_admin(ctx,'schedules',q=q);return
     if data.startswith('set:'):
         _,key,val=data.split(':')
-        col={'auto':'auto_enabled','forwards':'allow_forwards','nonlatin':'ban_nonlatin'}.get(key)
+        col={'auto':'auto_enabled','forwards':'allow_forwards','nonlatin':'ban_nonlatin',
+             'repost':'anti_repost_enabled','fastjoin':'anti_fast_join_enabled'}.get(key)
         if not col or val not in ('0','1'):await q.answer('Paramètre incorrect.',show_alert=True);return
         await setcfg(db,col,'true' if val=='1' else 'false')
         await q.answer('✅ Modifié.')
@@ -1377,6 +1586,12 @@ async def admin_callbacks(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         await setcfg(db,'anti_fast_join_minutes',minutes)
         await q.answer('✅ Durée modifiée.')
         await display_admin(ctx,'moderation',q=q);return
+    if data.startswith('inactive:'):
+        value=data.split(':')[1]
+        if value not in ('0','1'):
+            await q.answer('Option invalide.',show_alert=True);return
+        await setcfg(db,'inactive_enabled','true' if value=='1' else 'false')
+        await q.answer('✅ Modifié.');await display_admin(ctx,'inactive',q=q);return
     if data.startswith('audmedia:'):
         mid=int(data.split(':')[1])
         media=await db.fetchrow('''SELECT media_type,media_id,sha256,phash,video_phash,
@@ -1404,7 +1619,7 @@ async def admin_callbacks(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     if data.startswith('viptoggle:'):
         rid=int(data.split(':')[1]);await db.execute('UPDATE vip SET enabled=NOT enabled WHERE id=$1',rid)
         await q.answer('✅ Modifié.');await display_admin(ctx,'vips',q=q);return
-    if data in ('home','groups','schedules','moderation','trusted','rules','stats','posts','vips','orders','media','health','raffle'):
+    if data in ('home','groups','schedules','moderation','trusted','rules','stats','posts','vips','orders','media','health','raffle','inactive'):
         ctx.user_data.pop('adm_pending',None)
         await q.answer();await display_admin(ctx,data,q=q);return
     await q.answer('Option inconnue.',show_alert=True)
@@ -1416,8 +1631,8 @@ async def legacy_admin_callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
 
 async def stats_text(ctx,db):
     count=await ctx.bot.get_chat_member_count(current_group())
-    joins=await db.fetchval("SELECT count(*) FROM events WHERE kind='join'")
-    exits=await db.fetchval("SELECT count(*) FROM events WHERE kind='leave'")
+    joins=int(await cfg(db,'net_entries','0'))
+    exits=int(await cfg(db,'net_exits','0'))
     active=await db.fetchval('SELECT count(*) FROM members WHERE joined_at IS NOT NULL AND left_at IS NULL AND messages>0')
     idle=await db.fetchval('SELECT count(*) FROM members WHERE joined_at IS NOT NULL AND left_at IS NULL AND messages=0')
     validated=await db.fetchval('SELECT count(*) FROM referrals WHERE credited=true')
@@ -1913,7 +2128,9 @@ async def private_group_callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
 async def commands(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     bind_group(update,ctx)
     msg=update.effective_message;uid=update.effective_user.id
-    if update.effective_chat.type!='private':return
+    if update.effective_chat.type!='private':
+        await on_message(update,ctx)
+        return
     if not GROUPS:
         await msg.reply_text('🔐 Aucun groupe enregistré. Ajoute le bot comme administrateur dans un supergroupe puis confirme dans le groupe.')
         return
@@ -2324,8 +2541,12 @@ async def start_app():
     app.add_handler(CommandHandler('setup',group_setup_command))
     app.add_handler(CommandHandler('panel',panel))
     app.add_handler(CommandHandler('groups',select_private_group))
-    app.add_handler(CommandHandler(['start','help','invite','parrainage','top','classement','vips','vip','paysupport'],commands))
+    app.add_handler(CommandHandler(['start','help','invite','parrainage','top','classement','vips','vip','paysupport',
+        'stats','schedules','schedule','delschedule','word','unword','name','unname','trust','untrust',
+        'trusted','orders','approve','reject','rules','forward','nonlatin','open','close','resume',
+        'vipad','post','invitead','posts','delpost','vipadd','vipprice','vipoff'],commands))
     app.add_handler(CallbackQueryHandler(activation_callback,pattern=r'^onb:'))
+    app.add_handler(CallbackQueryHandler(group_role_callback,pattern=r'^role:'))
     app.add_handler(CallbackQueryHandler(private_group_callback,pattern=r'^pick:'))
     app.add_handler(CallbackQueryHandler(commerce_callbacks,pattern=r'^(vip|ref):'))
     app.add_handler(CallbackQueryHandler(review_callbacks,pattern=r'^review:'))
@@ -2336,6 +2557,8 @@ async def start_app():
     app.add_handler(ChatMemberHandler(bot_membership_update,ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(join_update,ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(ChatJoinRequestHandler(vip_join_request))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.PINNED_MESSAGE,pinned_notice))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.ALL,service_notice))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL,on_message))
     app.add_error_handler(on_error)
     app.job_queue.run_repeating(periodic_tick,60,first=3,name='tick_all')

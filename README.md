@@ -1,91 +1,48 @@
-# Telegram Guard Bot V8 — correction des paiements et groupes automatiques
+# Telegram Guard Bot — reconstruction V9
 
-## Correctifs de cette révision
+Bot Python pour Railway, Telegram et PostgreSQL. **Version de développement** : les tests locaux ne remplacent pas un essai réel sur un supergroupe isolé.
 
-- Les transitions d'ouverture et de fermeture sont sérialisées par groupe : deux contrôles simultanés ne peuvent plus publier des annonces contradictoires.
-- La fermeture retire l'épinglage et supprime les règles avant l'annonce finale. Si Telegram refuse la suppression, l'identifiant reste enregistré pour réessayer au contrôle suivant.
-- L'annonce de fermeture donne le prochain horaire réel dans le fuseau configuré. Sans horaire actif, elle dit clairement qu'une intervention administrative est nécessaire ou qu'aucun horaire n'est prévu.
-- Les décomptes liés aux horaires automatiques sont retirés lorsqu'une ouverture ou fermeture manuelle prend la main.
-- Un changement de groupe privé annule toute saisie administrative commencée dans un autre groupe.
-- Les empreintes photo bannies des anciennes versions sont migrées vers un index de recherche lors du démarrage. La comparaison ne relit plus toute l'ancienne liste pour chaque photo.
-- Les expressions des mots interdits sont compilées et conservées 15 secondes par groupe ; les modifications faites depuis le bot invalident immédiatement ce cache.
-- Les pools PostgreSQL des groupes ne gardent plus une connexion ouverte lorsqu'ils sont inactifs. La limite de trois connexions par groupe reste applicable en charge.
-- Validation locale : 39 tests, dont suppression des règles et transitions concurrentes, et compilation Python. Les migrations et les API Telegram doivent encore être vérifiées sur un groupe de test avec une sauvegarde PostgreSQL.
+## Installer
 
-> **Version de développement.** Syntaxe Python et tests locaux vérifiés ; aucun test de bout en bout n'a été réalisé avec Telegram, PostgreSQL ou Railway. Faites un essai sur un groupe isolé **avant** de remplacer un bot en production.
+1. Créer un bot avec BotFather et désactiver Privacy Mode pour recevoir tous les messages du groupe.
+2. Ajouter PostgreSQL sur Railway ; configurer `BOT_TOKEN`, `DATABASE_URL`, `OWNER_IDS` et éventuellement `TZ=Europe/Paris` et `TRUSTED_USER_IDS`.
+3. Installer `requirements.txt` et lancer un seul Worker avec `python -m app`. Ne pas lancer deux pollers avec le même token.
+4. Ajouter le bot comme administrateur d'un supergroupe avec suppression, restriction, invitation et épinglage ; choisir son rôle depuis les boutons. Confirmer le groupe principal ; `/setup` reprend une installation interrompue.
+5. Utiliser `/panel` en privé. Tester la fermeture et la suppression sur un groupe isolé avant la production.
 
-## Corrections V8
+## Architecture
 
-- **Crypto, PayPal, Revolut** sont les trois méthodes de commande manuelle proposées. Les frais Apple Pay de 15 % sont supprimés. Les méthodes non configurées dans Railway ne produisent pas de bouton inutilisable.
-- Le panneau de paiement affiche un montant en euros et le bot demande une image du justificatif. **Seul un OWNER peut approuver**, après avoir lui-même vérifié la réception effective des fonds ; le screenshot ne valide jamais un achat.
-- **Groupes détectés automatiquement** : lorsqu'un administrateur Telegram ajoute le bot dans un supergroupe, un enregistrement est créé en PostgreSQL puis le bot affiche une confirmation. Les droits sont revérifiés au clic. Sans cette confirmation, il n'active aucune modération.
-- Chaque supergroupe principal dispose d'un schéma PostgreSQL distinct ; les menus privés permettent de choisir le groupe.
-- Le bot peut démarrer **sans `GROUP_ID` ni `GROUP_IDS`**. Il relit le registre à chaque démarrage. Pour une migration V7, il récupère aussi les anciens schémas `guard_<id>` et conserve le groupe associé à `public`.
-- Les justificatifs et leurs boutons d'approbation sont désormais retrouvés **dans le groupe de la commande**, même si le propriétaire a sélectionné un autre groupe dans son panneau.
-- Les anciens achats en Paysafecard / Apple Pay sont conservés comme **historique** en base, mais aucun nouveau checkout ne les propose.
+- `app.py` : adaptateurs Telegram, configuration et orchestration périodique ; un verrou par groupe évite les transitions simultanées.
+- `schedule_policy.py` et `logic.py` : décision pure des horaires, chevauchements, minuit, overrides et mode teaser OFF.
+- `activity.py` : participation par ouverture, avertissement et purge.
+- `media_guard.py` et `media_pipeline.py` : analyse bornée des téléchargements, hash exact et perceptuel, vidéos multi-images et sanctions.
+- `multigroup.py` : routage par groupe ; `schema.sql` : tables par schéma PostgreSQL, migrations incrémentales.
+- `commerce_ui.py`, `vip_rules.py`, `admin_ui.py`, `onboarding.py` : vues et règles métier.
 
-## Variables d'environnement sur Railway
+## Comportement principal
 
-```dotenv
-BOT_TOKEN=123456:VOTRE_TOKEN_BOTFATHER
-DATABASE_URL=${{Postgres.DATABASE_URL}}
-OWNER_IDS=123456789
-TRUSTED_USER_IDS=234567890,345678901
-TZ=Europe/Paris
+- Mode automatique ON : décomptes horaires, puis 30, 15, 5, 3, 2 et 1 minutes ; ouverture et fermeture aux fenêtres configurées. Mode OFF : décompte promotionnel, groupe fermé et message « Restez branchés » au début du créneau.
+- Ouverture manuelle : maximum deux heures, avertissement privé au propriétaire quinze minutes avant expiration. Fermeture manuelle : jusqu'au prochain créneau ; reprise des horaires par bouton.
+- Chaque **décompte** remplace le précédent. Les règles ont leur propre message épinglé, remplacé toutes les trente minutes. Les publications texte ou photo ont leur propre cadence et remplacent chacune leur publication précédente. L'alerte de lien dure trente secondes.
+- À la fermeture, le bot supprime les annonces qu'il connaît et tente de supprimer tous les messages du groupe suivis pendant l'ouverture, en parcourant toutes les pages. Les échecs restent en base pour une nouvelle tentative.
+- Les entrées/sorties sont comptées depuis les événements reçus ; l'effectif réel est demandé à Telegram. L'historique antérieur à l'installation n'est pas reconstructible.
+- Le panneau « Inactifs » peut avertir en privé après une ouverture sans participation, rendre éligible après une seconde ouverture sans message, puis exclure sur décision du propriétaire. Un membre ainsi exclu qui revient est banni.
+- `/pedo`, `/mineur`, les signalements, filtres de mots/noms, anti-repost, invitations et VIP suivent le cahier des charges transmis.
 
-PAYMENT_CRYPTO_DETAILS=Adresse et réseau crypto à afficher
-PAYMENT_PAYPAL_DETAILS=Instructions PayPal à afficher
-PAYMENT_REVOLUT_DETAILS=Instructions Revolut à afficher
-```
+## Paiements
 
-- **Obligatoires** : `BOT_TOKEN`, `DATABASE_URL`, `OWNER_IDS`.
-- **Facultatives** : `TRUSTED_USER_IDS`, `TZ` et les 3 variables `PAYMENT_*` ; une méthode sans instruction n'est pas affichée au client.
-- **Inutiles en utilisation normale** : `GROUP_ID` et `GROUP_IDS`. Pour un ancien déploiement **V6 qui n'avait pas encore de registre de groupes**, fournissez temporairement le `GROUP_ID` original lors de la première mise à jour pour associer correctement le schéma `public` et préserver ses données. Pour une V7, le registre `public.guard_registry` suffit normalement.
-- Retirer de Railway `PAYMENT_PAYSAFECARD_DETAILS` et `PAYMENT_APPLE_PAY_DETAILS` : ils ne servent plus à rien.
-- Ne jamais publier le token Telegram, les chaînes de connexion, adresses privées ou captures de paiements.
+Les méthodes manuelles Crypto/PayPal/Revolut s'affichent seulement si leurs instructions `PAYMENT_*_DETAILS` existent. La preuve est une image ; seul le propriétaire confirme la réception effective de fonds, puis le bot délivre un lien VIP personnel. **La capture ne prouve pas un paiement.** Pour les accès numériques vendus à l'intérieur de Telegram, les règles actuelles de la plateforme exigent Telegram Stars ; le flux manuel demandé ici doit être remplacé par Stars avant une exploitation conforme.
 
-## Mise à jour V7 → V8 sans mélanger les données
+## Limites explicites
 
-1. **Sauvegarder PostgreSQL** (snapshot/export Railway) et conserver l'archive de la V7 pour revenir en arrière si nécessaire.
-2. Remplacer les sources par celles de la V8 ; conserver **la même base PostgreSQL**, pas une base neuve.
-3. Ajouter `PAYMENT_PAYPAL_DETAILS` et `PAYMENT_REVOLUT_DETAILS`, conserver `PAYMENT_CRYPTO_DETAILS`. Supprimer les 2 anciennes variables de paiement.
-4. Vous pouvez retirer `GROUP_IDS` : le registre des groupes V7 est relu en base et les schémas `guard_<id>` existants sont découverts. Si vous venez directement de V6, garder `GROUP_ID` pour le premier démarrage de migration.
-5. Déployer **une seule instance Worker** (`python -m app`) ; un seul polling Telegram par token.
-6. Dans un nouveau **supergroupe**, ajouter le bot en tant qu'administrateur ; accorder les droits de suppression, restriction, invitation et épinglage. Le bot doit proposer `✅ Confirmer`, `🔄 Revérifier`, `❌ Annuler` ; si le message n'arrive pas, un admin envoie `/setup` dans le groupe.
-7. Dans le chat privé du bot, le propriétaire utilise `/panel` puis **🌍 Choisir le groupe**. Les paramètres, VIP, invitations et statistiques ne sont pas communs entre groupes principaux.
-8. Tester sur un groupe de test : **création**, **confirmation**, **ouverture et fermeture**, **modération**, **parrainage**, **commande VIP**, **preuve**, **approbation**, **demande d'adhésion**, **expiration**, puis **redémarrage Railway**.
+- Telegram refuse normalement la suppression d'un message âgé de plus de 48 heures. Un bot ne peut pas récupérer l'historique complet d'un groupe ou des mises à jour perdues pendant une panne. La fermeture ne peut donc pas promettre une suppression absolument exhaustive.
+- Certains utilisateurs n'ont jamais ouvert le bot en privé : les avertissements privés d'inactivité échouent alors. Le panneau conserve leur statut d'inactivité.
+- L'analyse perceptuelle d'une grosse vidéo est asynchrone ; un média peut être visible brièvement avant sanction. Le cloud Bot API limite les téléchargements des fichiers volumineux.
+- Les fonctionnalités Telegram et les migrations PostgreSQL doivent être validées sur Railway. Les tests locaux vérifient seulement la logique et les scénarios simulés.
 
-> **Important** : La détection et la confirmation automatiques concernent actuellement les **groupes principaux gérés par horaires**. Les groupes de destination VIP restent déclarés dans la configuration d'une offre (panneau 💎 VIP) afin d'éviter de les fermer comme un groupe principal. Il n'existe pas encore de sélecteur automatique de rôle `principal / VIP / logs` au moment de l'ajout. Cela reste une limitation fonctionnelle.
-
-## Fonctions du bot conservées
-
-- Panneau **propriétaire à boutons** (`/panel`) : horaires, auto ON/OFF, ouverture manuelle avec sécurité, fermeture, décomptes, modération, filtres, trusted, publicités, règles, VIP, commandes, médias et santé.
-- Modération et empreintes médias : identifiant Telegram, SHA-256, hash perceptuel photos, vidéo sur plusieurs images via FFmpeg, anti-repost et contrôles des nouvelles arrivées.
-- Trusted users : commandes réservées (`/pedo`, `/mineur`, etc.). Leurs droits sont différents des propriétaires et ne donnent pas accès à l'approbation des paiements.
-- Invitations : lien personnel, points attribués après présence, tableau de bord, TOP 10 masqué et tirage au sort.
-- VIP : sélection multiple, prix en euros, durée personnalisable (dont **24 h**), accès à vie, groupe 24/24, déblocage par invitations ou commande manuelle, lien d'adhésion avec vérification de l'identifiant Telegram, notification/expiration.
-
-## Paiement : avertissement Telegram
-
-**Telegram exige officiellement Telegram Stars (`XTR`) pour vendre des biens et accès numériques *dans les bots*.** Le parcours externe Crypto / PayPal / Revolut de cette V8 peut contrevenir aux règles Telegram et provoquer une restriction du bot. Le fait de présenter une commande comme « manuelle » ne change pas cette obligation. Cette version fournit le flux demandé mais **n'est pas un système de vente d'accès numériques conforme à Telegram**. Pour mettre ce parcours en production dans Telegram, il faut utiliser Stars. Voir https://core.telegram.org/bots/payments-stars et https://telegram.org/tos/bot-developers.
-
-Une capture d'écran de transfert est falsifiable. L'OWNER doit vérifier la réception dans son compte PayPal/Revolut ou la confirmation on-chain avant d'appuyer sur le bouton de validation.
-
-## Limites et cohérence
-
-- Les bans **ne se synchronisent pas automatiquement entre plusieurs groupes**. Le panneau et les listes d'empreintes bannies sont actuellement propres à chaque groupe principal.
-- Les anciens membres inconnus ne peuvent pas tous être listés par l'API Bot Telegram. Le suivi entre/sorties est basé sur les événements observés, les effectifs réels utilisent l'API compteur de Telegram.
-- Effacer des messages anciens reste soumis aux limitations de suppression de l'API Telegram ; l'analyse perceptuelle des grosses vidéos est asynchrone et non instantanée.
-- La base crée un petit pool de connexions **par groupe** : surveiller le nombre de connexions PostgreSQL si vous ajoutez des dizaines de groupes.
-- La détection automatique ne doit pas être confondue avec une fonction d'administration globale de rôles VIP/logs. Un groupe VIP ne doit pas être activé par erreur comme un groupe principal à horaires.
-- Les droits admin du bot et le paramètre Privacy Mode (BotFather) doivent être testés sur Telegram réel ; la compilation ne peut pas prouver leur bon fonctionnement.
-- Si un ancien bot V6 utilisait déjà le schéma `public` sans la table `guard_registry`, **ne lancez pas V8 sur un nouveau groupe avec cette ancienne base sans indiquer d'abord le `GROUP_ID` historique**.
-
-## Tests locaux
+## Validation locale
 
 ```bash
 python run_tests.py
 python -m compileall -q .
 ```
-
-Les tests de logique et de câblage sont exécutables sans identifiants. **Les dépendances `python-telegram-bot` et `asyncpg` ne sont pas présentes dans l'environnement de validation utilisé ici** ; un test réel de l'API Telegram et des migrations PostgreSQL reste à faire.
